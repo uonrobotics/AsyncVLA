@@ -8,8 +8,8 @@ Train or finetune AsyncVLA
 # Configuration Flags
 # ==============================
 TRAIN_BASE = False   # True: training BASE VLA (if True, you need H100 or H200.)
-TRAIN_HEAD = True    # True: training Edge adapter and token projector
-VISUALIZE = False    # True: save visualization images of policy performance
+TRAIN_HEAD = False    # True: training Edge adapter and token projector
+VISUALIZE = True    # True: save visualization images of policy performance
 
 # ==============================
 # Path Setup
@@ -101,11 +101,12 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, IGNORE_INDEX
 
 #dataset
-from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
-from prismatic.vla.datasets.lelan_dataset import LeLaN_Dataset_rand
-from prismatic.vla.datasets.gnm_dataset import GNM_Dataset_rand
-from prismatic.vla.datasets.sacson_dataset import SACSoN_Dataset_rand
-from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
+# from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
+# from prismatic.vla.datasets.lelan_dataset import LeLaN_Dataset_rand
+# from prismatic.vla.datasets.gnm_dataset import GNM_Dataset_rand
+# from prismatic.vla.datasets.sacson_dataset import SACSoN_Dataset_rand
+# from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
+from prismatic.vla.datasets.goto_sim_dataset import GotoSim_Dataset
 
 #small head model
 from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens
@@ -229,6 +230,9 @@ class OmniVLAConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+    
+    # Inference seed
+    inference_seed: Optional[int] = None             # Random seed for inference (for reproducibility of visualizations)
 
 def remove_ddp_in_checkpoint(state_dict) -> dict:
     new_state_dict = {}
@@ -556,12 +560,12 @@ def run_forward_pass(
         action_orig[:, :, 3] = torch.sin(torch.tensor(0.0))        
         sm_ref = torch.cat((action_orig.to(torch.bfloat16).to(device_id), predicted_actions[:,0:-1]), dim=1)
 
-        loss = 0.5*torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool]) + 0.5*15.0*torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool]) + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(sm_ref, predicted_actions)
-
         L2_daction = torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool])
         L2_action = torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool])
         L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool])
         L2_smooth = torch.nn.MSELoss()(sm_ref, predicted_actions)
+        
+        loss = 0.5*L2_action + 0.5*15.0*L2_daction + 0.1*L2_obj + 0.1*L2_smooth
             
         loss_list = []
         task_list = []
@@ -842,11 +846,27 @@ def merge_batches_padding(batch_list, pad_token_id, IGNORE_INDEX, model_max_leng
     merged["goal_mask_select"] = torch.tensor(merged["modality_id"])
     return merged
 
+# Policy inference 비교 위해서 seed 고정
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # torch.use_deterministic_algorithms(True)
+
 @draccus.wrap()
 def train_asyncvla(cfg: OmniVLAConfig) -> None:
     """
     Training AsyncVLA on demonstration dataset via LoRA.
     """
+    if cfg.inference_seed is not None:
+        set_seed(cfg.inference_seed)
+    
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
 
     # Trim trailing forward slash ('/') in VLA path if it exists
@@ -1074,206 +1094,244 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
         tokenizer_max_length, processor.tokenizer.pad_token_id, padding_side="right", num_img = cfg.num_images_in_input
         
     )
-    Bgnm, Blan, Bsacson = 1, 1, 1    
+    # Bgnm, Blan, Bsacson = 1, 1, 1    
     #Bgnm, Blan, Bsacson = 30, 30, 30
 
     train_dataset_dummy = []
     test_dataset_dummy = []        
     for data_split_type in ["train"]:     
-        #dummy dataset
-        dataset_dummy = Dummy_Dataset(   
-            context_size = config["context_size"],             
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer, 
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,                                                                         
-        ) 
+        #Goto sim dataset
         if data_split_type == "train":
-            train_dataset_dummy.append(dataset_dummy)
-        elif data_split_type == "test":
-            test_dataset_dummy.append(dataset_dummy)
-                    
-        if data_split_type == "train":                   
-            train_dataset_dummy = ConcatDataset(train_dataset_dummy)
-            sampler_train_dummy = DistributedSampler(train_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True) 
-                
-            train_loader_dummy = DataLoader(
-                train_dataset_dummy,
-                batch_size=1,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=8,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_dummy,
-            )                  
-        else:
-            test_dataset_dummy = ConcatDataset(test_dataset_dummy) 
-            sampler_test_dummy = DistributedSampler(test_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True)                 
-
-            test_loader_dummy = DataLoader(
-                test_dataset_dummy,
+            dataset_gotosim = GotoSim_Dataset(
+                root_dir=cfg.data_root_dir,
+                image_transform=processor.image_processor.apply_transform,
+                action_tokenizer=action_tokenizer,
+                prompt_builder_fn=PurePromptBuilder,
+                base_tokenizer=processor.tokenizer,
+            )
+            
+            train_dataset_gotosim = []
+            train_dataset_gotosim.append(dataset_gotosim)
+            train_dataset_gotosim = ConcatDataset(train_dataset_gotosim)
+            
+            sampler_train_gotosim = DistributedSampler(
+                train_dataset_gotosim,
+                num_replicas=world_size,
+                rank=device_id,
+                shuffle=True,
+                seed=cfg.inference_seed if cfg.inference_seed is not None else 0,
+            )
+            
+            if cfg.inference_seed is not None:
+                g = torch.Generator()
+                g.manual_seed(cfg.inference_seed)
+            
+            train_loader_gotosim = DataLoader(
+                train_dataset_gotosim,
                 batch_size=cfg.batch_size,
                 shuffle=False,
                 collate_fn=collator,
-                num_workers=8,
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_dummy,
-            )           
-
-        #GNM dataset   
-        train_dataset_gnm = []
-        test_dataset_gnm = [] 
-        for dataset_name in config["datasets_gnm"]:       
-            if dataset_name in ["distance", "action"]:
-                continue
-                
-            data_config_sub = config["datasets_gnm"][dataset_name]
-            if "negative_mining" not in data_config_sub:
-                data_config_sub["negative_mining"] = True
-            if "goals_per_obs" not in data_config_sub:
-                data_config_sub["goals_per_obs"] = 1
-            if "end_slack" not in data_config_sub:
-                data_config_sub["end_slack"] = 0
-            if "waypoint_spacing" not in data_config_sub:
-                data_config_sub["waypoint_spacing"] = 1
-            if data_split_type in data_config_sub:
-                dataset_gnm = GNM_Dataset_rand(
-                    action_tokenizer=action_tokenizer,
-                    base_tokenizer=processor.tokenizer,
-                    image_transform=processor.image_processor.apply_transform,
-                    prompt_builder_fn=PurePromptBuilder,
-                    data_folder=data_config_sub["data_folder"],
-                    data_split_folder=data_config_sub[data_split_type],
-                    dataset_name=dataset_name,
-                    image_size=config["image_size"],
-                    waypoint_spacing=data_config_sub["waypoint_spacing"],
-                    min_dist_cat=config["datasets_gnm"]["distance"]["min_dist_cat"],
-                    max_dist_cat=config["datasets_gnm"]["distance"]["max_dist_cat"],
-                    min_action_distance=config["datasets_gnm"]["action"]["min_dist_cat"],
-                    max_action_distance=config["datasets_gnm"]["action"]["max_dist_cat"],
-                    negative_mining=data_config_sub["negative_mining"],
-                    len_traj_pred=config["len_traj_pred"],
-                    learn_angle=config["learn_angle"],
-                    context_size=config["context_size"],
-                    context_type=config["context_type"],
-                    end_slack=data_config_sub["end_slack"],
-                    goals_per_obs=data_config_sub["goals_per_obs"],
-                    normalize=config["normalize"],
-                )
-            if data_split_type == "train":    
-                train_dataset_gnm.append(dataset_gnm)
-                     
-        if data_split_type == "train":                     
-            train_dataset_gnm = ConcatDataset(train_dataset_gnm)
-            sampler_train_gnm = DistributedSampler(train_dataset_gnm, num_replicas=world_size, rank=device_id, shuffle=True)                    
-            train_loader_gnm = DataLoader(
-                train_dataset_gnm,
-                batch_size=Bgnm,
-                shuffle=False,
                 num_workers=config["num_workers"],
-                collate_fn=collator,
                 drop_last=True,
                 persistent_workers=True,
-                sampler=sampler_train_gnm,
-            )                  
-
-        #LeLaN dataset
-        train_dataset_lan = []
-        test_dataset_lan = []                         
-        for dataset_name_lan in config["datasets_lelan"]:
-            data_config_lan = config["datasets_lelan"][dataset_name_lan]   
-            dataset_lelan = LeLaN_Dataset_rand(
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer, 
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,                  
-                data_split_folder=data_config_lan[data_split_type],
-                dataset_name=dataset_name_lan,
-                image_size=config["image_size"],
-                waypoint_spacing=1,
-                len_traj_pred=config["len_traj_pred"],
-                learn_angle=config["learn_angle"],
-                context_size=config["context_size"],
-                data_split_type = data_split_type,
-                data_image_folder = data_config_lan["image"],
-                data_pickle_folder = data_config_lan["pickle"],                                                                        
-                context_type=config["context_type"],
-                normalize=config["normalize"],
-                backside=data_config_lan["backside"],
-                aug_seq=data_config_lan["aug_seq"],   
-                only_front=data_config_lan["only_front"],                                                                       
-            ) 
-            if data_split_type == "train":
-                train_dataset_lan.append(dataset_lelan)
-                    
-        if data_split_type == "train":                   
-            train_dataset_lan = ConcatDataset(train_dataset_lan)
+                sampler=sampler_train_gotosim,
+                generator=g if cfg.inference_seed is not None else None,
+            )
             
-            if False: #In our original training, we did not weight the dataset. But we noticed that it does help a bit.            
-                dataset_sizes = [len(ds) for ds in train_dataset_lan.datasets]
-                total_size = sum(dataset_sizes)
-
-                # Weight is inverse of dataset size
-                weights_per_dataset = [1.0 / size for size in dataset_sizes]
-                vis_weights_per_dataset = [w / weights_per_dataset[0] for w in weights_per_dataset]
-
-                sample_weights = []
-                for size, w in zip(dataset_sizes, weights_per_dataset):
-                    sample_weights.extend([w] * size)
-                sample_weights = torch.DoubleTensor(sample_weights)
-                sampler_train_lelan = DistributedWeightedSampler(sample_weights, num_samples=total_size, replacement=True)
-            else:
-                sampler_train_lelan = DistributedSampler(train_dataset_lan, num_replicas=world_size, rank=device_id, shuffle=True) 
+        # #dummy dataset
+        # dataset_dummy = Dummy_Dataset(   
+        #     context_size = config["context_size"],             
+        #     action_tokenizer=action_tokenizer,
+        #     base_tokenizer=processor.tokenizer, 
+        #     image_transform=processor.image_processor.apply_transform,
+        #     prompt_builder_fn=PurePromptBuilder,                                                                         
+        # ) 
+        # if data_split_type == "train":
+        #     train_dataset_dummy.append(dataset_dummy)
+        # elif data_split_type == "test":
+        #     test_dataset_dummy.append(dataset_dummy)
+                    
+        # if data_split_type == "train":                   
+        #     train_dataset_dummy = ConcatDataset(train_dataset_dummy)
+        #     sampler_train_dummy = DistributedSampler(train_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True) 
                 
-            train_loader_lelan = DataLoader(
-                train_dataset_lan,
-                batch_size=Blan,
-                shuffle=False,
-                collate_fn=collator,
-                num_workers=config["num_workers"],
-                drop_last=True,
-                persistent_workers=True,
-                sampler=sampler_train_lelan,
-            )                      
+        #     train_loader_dummy = DataLoader(
+        #         train_dataset_dummy,
+        #         batch_size=1,
+        #         shuffle=False,
+        #         collate_fn=collator,
+        #         num_workers=8,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_dummy,
+        #     )                  
+        # else:
+        #     test_dataset_dummy = ConcatDataset(test_dataset_dummy) 
+        #     sampler_test_dummy = DistributedSampler(test_dataset_dummy, num_replicas=world_size, rank=device_id, shuffle=True)                 
 
-        #SACSoN dataset                   
-        for dataset_name_sacson in config["datasets_sacson"]:
-            data_config_sacson = config["datasets_sacson"][dataset_name_sacson]  
-            train_dataset_sacson = SACSoN_Dataset_rand( 
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer, 
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,                  
-                data_split_folder=data_config_sacson[data_split_type],
-                dataset_name=dataset_name_sacson,
-                image_size=config["image_size"],
-                waypoint_spacing=1,
-                len_traj_pred=config["len_traj_pred"],
-                learn_angle=config["learn_angle"],
-                context_size=config["context_size"],
-                data_split_type = data_split_type,
-                data_image_folder = data_config_sacson["image"],
-                data_pickle_folder = data_config_sacson["pickle"],                                                                        
-                context_type=config["context_type"],
-                normalize=config["normalize"],
-                backside=data_config_sacson["backside"],
-                aug_seq=data_config_sacson["aug_seq"],   
-                only_front=data_config_sacson["only_front"],                                                                       
-            ) 
+        #     test_loader_dummy = DataLoader(
+        #         test_dataset_dummy,
+        #         batch_size=cfg.batch_size,
+        #         shuffle=False,
+        #         collate_fn=collator,
+        #         num_workers=8,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_dummy,
+        #     )           
 
-        sampler_train_sacson = DistributedSampler(train_dataset_sacson, num_replicas=world_size, rank=device_id, shuffle=True)                    
-        train_loader_sacson = DataLoader(
-            train_dataset_sacson,
-            batch_size=Bsacson,
-            shuffle=False,
-            num_workers=config["num_workers"],
-            collate_fn=collator,
-            drop_last=True,
-            persistent_workers=True,
-            sampler=sampler_train_sacson,
-        )  
+        # #GNM dataset   
+        # train_dataset_gnm = []
+        # test_dataset_gnm = [] 
+        # for dataset_name in config["datasets_gnm"]:       
+        #     if dataset_name in ["distance", "action"]:
+        #         continue
+                
+        #     data_config_sub = config["datasets_gnm"][dataset_name]
+        #     if "negative_mining" not in data_config_sub:
+        #         data_config_sub["negative_mining"] = True
+        #     if "goals_per_obs" not in data_config_sub:
+        #         data_config_sub["goals_per_obs"] = 1
+        #     if "end_slack" not in data_config_sub:
+        #         data_config_sub["end_slack"] = 0
+        #     if "waypoint_spacing" not in data_config_sub:
+        #         data_config_sub["waypoint_spacing"] = 1
+        #     if data_split_type in data_config_sub:
+        #         dataset_gnm = GNM_Dataset_rand(
+        #             action_tokenizer=action_tokenizer,
+        #             base_tokenizer=processor.tokenizer,
+        #             image_transform=processor.image_processor.apply_transform,
+        #             prompt_builder_fn=PurePromptBuilder,
+        #             data_folder=data_config_sub["data_folder"],
+        #             data_split_folder=data_config_sub[data_split_type],
+        #             dataset_name=dataset_name,
+        #             image_size=config["image_size"],
+        #             waypoint_spacing=data_config_sub["waypoint_spacing"],
+        #             min_dist_cat=config["datasets_gnm"]["distance"]["min_dist_cat"],
+        #             max_dist_cat=config["datasets_gnm"]["distance"]["max_dist_cat"],
+        #             min_action_distance=config["datasets_gnm"]["action"]["min_dist_cat"],
+        #             max_action_distance=config["datasets_gnm"]["action"]["max_dist_cat"],
+        #             negative_mining=data_config_sub["negative_mining"],
+        #             len_traj_pred=config["len_traj_pred"],
+        #             learn_angle=config["learn_angle"],
+        #             context_size=config["context_size"],
+        #             context_type=config["context_type"],
+        #             end_slack=data_config_sub["end_slack"],
+        #             goals_per_obs=data_config_sub["goals_per_obs"],
+        #             normalize=config["normalize"],
+        #         )
+        #     if data_split_type == "train":    
+        #         train_dataset_gnm.append(dataset_gnm)
+                     
+        # if data_split_type == "train":                     
+        #     train_dataset_gnm = ConcatDataset(train_dataset_gnm)
+        #     sampler_train_gnm = DistributedSampler(train_dataset_gnm, num_replicas=world_size, rank=device_id, shuffle=True)                    
+        #     train_loader_gnm = DataLoader(
+        #         train_dataset_gnm,
+        #         batch_size=Bgnm,
+        #         shuffle=False,
+        #         num_workers=config["num_workers"],
+        #         collate_fn=collator,
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_gnm,
+        #     )                  
+
+        # #LeLaN dataset
+        # train_dataset_lan = []
+        # test_dataset_lan = []                         
+        # for dataset_name_lan in config["datasets_lelan"]:
+        #     data_config_lan = config["datasets_lelan"][dataset_name_lan]   
+        #     dataset_lelan = LeLaN_Dataset_rand(
+        #         action_tokenizer=action_tokenizer,
+        #         base_tokenizer=processor.tokenizer, 
+        #         image_transform=processor.image_processor.apply_transform,
+        #         prompt_builder_fn=PurePromptBuilder,                  
+        #         data_split_folder=data_config_lan[data_split_type],
+        #         dataset_name=dataset_name_lan,
+        #         image_size=config["image_size"],
+        #         waypoint_spacing=1,
+        #         len_traj_pred=config["len_traj_pred"],
+        #         learn_angle=config["learn_angle"],
+        #         context_size=config["context_size"],
+        #         data_split_type = data_split_type,
+        #         data_image_folder = data_config_lan["image"],
+        #         data_pickle_folder = data_config_lan["pickle"],                                                                        
+        #         context_type=config["context_type"],
+        #         normalize=config["normalize"],
+        #         backside=data_config_lan["backside"],
+        #         aug_seq=data_config_lan["aug_seq"],   
+        #         only_front=data_config_lan["only_front"],                                                                       
+        #     ) 
+        #     if data_split_type == "train":
+        #         train_dataset_lan.append(dataset_lelan)
+                    
+        # if data_split_type == "train":                   
+        #     train_dataset_lan = ConcatDataset(train_dataset_lan)
+            
+        #     if False: #In our original training, we did not weight the dataset. But we noticed that it does help a bit.            
+        #         dataset_sizes = [len(ds) for ds in train_dataset_lan.datasets]
+        #         total_size = sum(dataset_sizes)
+
+        #         # Weight is inverse of dataset size
+        #         weights_per_dataset = [1.0 / size for size in dataset_sizes]
+        #         vis_weights_per_dataset = [w / weights_per_dataset[0] for w in weights_per_dataset]
+
+        #         sample_weights = []
+        #         for size, w in zip(dataset_sizes, weights_per_dataset):
+        #             sample_weights.extend([w] * size)
+        #         sample_weights = torch.DoubleTensor(sample_weights)
+        #         sampler_train_lelan = DistributedWeightedSampler(sample_weights, num_samples=total_size, replacement=True)
+        #     else:
+        #         sampler_train_lelan = DistributedSampler(train_dataset_lan, num_replicas=world_size, rank=device_id, shuffle=True) 
+                
+        #     train_loader_lelan = DataLoader(
+        #         train_dataset_lan,
+        #         batch_size=Blan,
+        #         shuffle=False,
+        #         collate_fn=collator,
+        #         num_workers=config["num_workers"],
+        #         drop_last=True,
+        #         persistent_workers=True,
+        #         sampler=sampler_train_lelan,
+        #     )                      
+
+        # #SACSoN dataset                   
+        # for dataset_name_sacson in config["datasets_sacson"]:
+        #     data_config_sacson = config["datasets_sacson"][dataset_name_sacson]  
+        #     train_dataset_sacson = SACSoN_Dataset_rand( 
+        #         action_tokenizer=action_tokenizer,
+        #         base_tokenizer=processor.tokenizer, 
+        #         image_transform=processor.image_processor.apply_transform,
+        #         prompt_builder_fn=PurePromptBuilder,                  
+        #         data_split_folder=data_config_sacson[data_split_type],
+        #         dataset_name=dataset_name_sacson,
+        #         image_size=config["image_size"],
+        #         waypoint_spacing=1,
+        #         len_traj_pred=config["len_traj_pred"],
+        #         learn_angle=config["learn_angle"],
+        #         context_size=config["context_size"],
+        #         data_split_type = data_split_type,
+        #         data_image_folder = data_config_sacson["image"],
+        #         data_pickle_folder = data_config_sacson["pickle"],                                                                        
+        #         context_type=config["context_type"],
+        #         normalize=config["normalize"],
+        #         backside=data_config_sacson["backside"],
+        #         aug_seq=data_config_sacson["aug_seq"],   
+        #         only_front=data_config_sacson["only_front"],                                                                       
+        #     ) 
+
+        # sampler_train_sacson = DistributedSampler(train_dataset_sacson, num_replicas=world_size, rank=device_id, shuffle=True)                    
+        # train_loader_sacson = DataLoader(
+        #     train_dataset_sacson,
+        #     batch_size=Bsacson,
+        #     shuffle=False,
+        #     num_workers=config["num_workers"],
+        #     collate_fn=collator,
+        #     drop_last=True,
+        #     persistent_workers=True,
+        #     sampler=sampler_train_sacson,
+        # )  
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
@@ -1288,8 +1346,11 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
         "L2_lan": deque(maxlen=cfg.grad_accumulation_steps),          
         "L2_lan_pose": deque(maxlen=cfg.grad_accumulation_steps),                                            
     }    
-    iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_sacson)]
-    samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_sacson]          
+    # iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_sacson)]
+    # samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_sacson]          
+    iters = [iter(train_loader_gotosim)]
+    samplers = [sampler_train_gotosim]
+    
                                                                   
     log_count = 0
     for epoch in range(100):
@@ -1326,7 +1387,8 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
                     try:
                         batch = next(it)
                     except StopIteration:
-                        iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_sacson][i])
+                        # iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_sacson][i])
+                        iters[i] = iter([train_loader_gotosim][i])
                         batch = next(iters[i])
                     batches.append(batch)
                 
