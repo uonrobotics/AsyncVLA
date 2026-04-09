@@ -1353,124 +1353,138 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
     
                                                                   
     log_count = 0
-    for epoch in range(100):
-        for sampler in samplers:
-            sampler.set_epoch(epoch)
-                
-        with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-            if TRAIN_BASE:
-                print("setting up training mode")
-                vla.train()
-                if TRAIN_HEAD:
-                    action_proj.train()
-                    shead.train()
-                else:
-                    action_proj.eval()
-                    shead.eval()
-            else:
-                print("setting up eval (Local PC coding) mode")
-                vla.eval()
-                action_head.eval()
-                #action_proj.eval()
-                pose_projector.eval()
-                if TRAIN_HEAD:
-                    action_proj.train()
-                    shead.train()          
-                else:
-                    action_proj.eval()
-                    shead.eval()                                  
-                
-            optimizer.zero_grad()
-            for batch_idx in range(cfg.max_steps):
-                batches = []
-                for i, it in enumerate(iters):
-                    try:
-                        batch = next(it)
-                    except StopIteration:
-                        # iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_sacson][i])
-                        iters[i] = iter([train_loader_gotosim][i])
-                        batch = next(iters[i])
-                    batches.append(batch)
-                
-                #Merging multiple datasets
-                merged_batch = merge_batches_padding(batches, processor.tokenizer.pad_token_id, IGNORE_INDEX, tokenizer_max_length)                  
+    epoch = 0
 
-                # Compute training metrics and loss
-                loss, metrics = run_forward_pass(
+    if TRAIN_BASE:
+        print("setting up training mode")
+        vla.train()
+        if TRAIN_HEAD:
+            action_proj.train()
+            shead.train()
+        else:
+            action_proj.eval()
+            shead.eval()
+    else:
+        print("setting up eval (Local PC coding) mode")
+        vla.eval()
+        action_head.eval()
+        #action_proj.eval()
+        pose_projector.eval()
+        if TRAIN_HEAD:
+            action_proj.train()
+            shead.train()
+        else:
+            action_proj.eval()
+            shead.eval()
+
+    optimizer.zero_grad()
+
+    # 처음 epoch seed 설정
+    for sampler in samplers:
+        sampler.set_epoch(epoch)
+
+    # 첫 iterator 생성
+    iters = [iter(train_loader_gotosim)]
+
+    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+        for batch_idx in range(cfg.max_steps):
+            batches = []
+
+            for i, it in enumerate(iters):
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    print(f"Epoch {epoch} finished. Restarting iterator.")
+                    epoch += 1
+                    for sampler in samplers:
+                        sampler.set_epoch(epoch)
+
+                    iters[i] = iter([train_loader_gotosim][i])
+                    batch = next(iters[i])
+
+                batches.append(batch)
+
+            #Merging multiple datasets
+            merged_batch = merge_batches_padding(batches, processor.tokenizer.pad_token_id, IGNORE_INDEX, tokenizer_max_length)                  
+
+
+            # Compute training metrics and loss
+            loss, metrics = run_forward_pass(
+                vla=vla,
+                action_head=action_head,
+                action_proj=action_proj,
+                shead=shead,
+                pose_projector=pose_projector,
+                batch=merged_batch,
+                action_tokenizer=action_tokenizer,
+                device_id=device_id,
+                num_patches=NUM_PATCHES,
+                idrun=batch_idx,
+            )
+
+            # Normalize loss to account for gradient accumulation
+            normalized_loss = loss / cfg.grad_accumulation_steps
+
+            # Backward pass
+            if TRAIN_BASE:
+                normalized_loss.backward()
+            elif TRAIN_HEAD:
+                normalized_loss.backward()
+
+            # Store recent train metrics
+            for metric_name, value in metrics.items():
+                if metric_name in recent_metrics:
+                    recent_metrics[metric_name].append(value)
+
+            # Compute gradient step index
+            gradient_step_idx = log_count // cfg.grad_accumulation_steps
+            log_count += 1
+
+            # Push Metrics to W&B (every wandb_log_freq gradient steps)
+            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+
+            smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+
+            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+            if cfg.lr_warmup_steps > 0:
+                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = current_lr
+
+            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+                # Log the learning rate
+                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+                wandb.log(
+                    {
+                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                    },
+                    step=log_step,
+                )
+
+            # Optimizer and LR scheduler step
+            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                progress.update()
+
+            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
+            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:            
+                save_training_checkpoint(
+                    cfg=cfg,
+                    run_dir=run_dir,
+                    log_step=log_step,
                     vla=vla,
+                    processor=processor,
+                    pose_projector=pose_projector,
                     action_head=action_head,
                     action_proj=action_proj,
                     shead=shead,
-                    pose_projector=pose_projector,
-                    batch=merged_batch,
-                    action_tokenizer=action_tokenizer,
-                    device_id=device_id,
-                    num_patches=NUM_PATCHES,
-                    idrun=batch_idx,
+                    distributed_state=distributed_state,
                 )
-                # Normalize loss to account for gradient accumulation
-                normalized_loss = loss / cfg.grad_accumulation_steps
-                        
-                # Backward pass
-                if TRAIN_BASE:
-                    normalized_loss.backward()
-                elif TRAIN_HEAD:
-                    normalized_loss.backward()
-
-                # Store recent train metrics
-                for metric_name, value in metrics.items():
-                    if metric_name in recent_metrics:
-                        recent_metrics[metric_name].append(value)
-
-                # Compute gradient step index
-                gradient_step_idx = log_count // cfg.grad_accumulation_steps
-                log_count += 1
-
-                # Push Metrics to W&B (every wandb_log_freq gradient steps)
-                log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-
-                smoothened_metrics = compute_smoothened_metrics(recent_metrics)
-                if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                    log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
-
-                # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-                if cfg.lr_warmup_steps > 0:
-                    lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
-                    current_lr = original_lr * (0.1 + 0.9 * lr_progress)
-                    for param_group in optimizer.param_groups:
-                        param_group["lr"] = current_lr
-
-                if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                    # Log the learning rate
-                    # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                    wandb.log(
-                        {
-                            "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                        },
-                        step=log_step,
-                    )
-
-                # Optimizer and LR scheduler step
-                if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    progress.update()
-
-                # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-                if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:            
-                    save_training_checkpoint(
-                        cfg=cfg,
-                        run_dir=run_dir,
-                        log_step=log_step,
-                        vla=vla,
-                        processor=processor,
-                        pose_projector=pose_projector,
-                        action_head=action_head,
-                        action_proj=action_proj,
-                        shead=shead,
-                        distributed_state=distributed_state,
-                    )
 
 if __name__ == "__main__":
     train_asyncvla()
