@@ -14,6 +14,7 @@ VISUALIZE = True    # True: save visualization images of policy performance
 # ==============================
 # Path Setup
 # ==============================
+import re
 import sys
 from pathlib import Path
 
@@ -539,6 +540,13 @@ def run_forward_pass(
             .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)
+        
+        # For visualization of raw VLA predictions (without edge adapter correction), we also compute the predicted actions without gradient tracking
+        with torch.no_grad():
+            raw_predicted_actions = action_head.module.predict_action(
+                actions_hidden_states.detach(),
+                modality_id.to(torch.bfloat16).to(device_id)
+            )
 
         # Predict action
         if TRAIN_HEAD:
@@ -596,8 +604,9 @@ def run_forward_pass(
                 batch["gimg_PIL"],              
                 obj_pose_norm.detach().cpu(),   
                 batch["goal_pose"].detach().cpu(),
-                ground_truth_actions.detach().cpu(), 
-                predicted_actions.detach().cpu(),   
+                ground_truth_actions.detach().cpu(),     # GT
+                raw_predicted_actions.detach().cpu(),    # raw VLM
+                predicted_actions.detach().cpu(),        # edge-adapter corrected
                 batch["goal_mask_select"], 
                 batch["lan_prompts"],         
                 "train",   
@@ -605,8 +614,8 @@ def run_forward_pass(
                 idrun,                              
                 1,                  
                 False,                               
-                )                                        
-
+                )      
+                                              
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
 
@@ -741,8 +750,9 @@ def visualize_train(
     batch_goal_PIL: torch.Tensor,  
     goal_pos_lan: torch.Tensor, 
     goal_pos: torch.Tensor, 
-    traj_raw: torch.Tensor,
-    est_traj: torch.Tensor,
+    traj_gt: torch.Tensor,
+    traj_vlm_raw: torch.Tensor,
+    traj_edge: torch.Tensor,
     goal_mask_select: torch.Tensor,
     lan_prompts: list,
     eval_type: str,    
@@ -784,14 +794,51 @@ def visualize_train(
         ygt = to_numpy(goal_pos_gt[i,1])
         task_id = goal_mask_select[i].item()
             
-        x_raw = traj_raw[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_raw = traj_raw[i, :, 1].detach().cpu().to(torch.float32).numpy()       
-        x_est = est_traj[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_est = est_traj[i, :, 1].detach().cpu().to(torch.float32).numpy()          
+        # GT trajectory
+        x_gt_traj = traj_gt[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_gt_traj = traj_gt[i, :, 1].detach().cpu().to(torch.float32).numpy()
 
-        ax_graph.plot(-np.insert(y_est, 0, 0.0), np.insert(x_est, 0, 0.0), linewidth=4.0, markersize=12, marker='o', color='blue', label="est")                                                      
-        ax_graph.plot(-y_raw, x_raw, marker = 'o', color='red', label="raw")                                             
-        ax_graph.plot(-ygt, xgt, marker = '*', color='red')   
+        # Raw VLM trajectory
+        x_vlm = traj_vlm_raw[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_vlm = traj_vlm_raw[i, :, 1].detach().cpu().to(torch.float32).numpy()
+
+        # Edge-adapter corrected trajectory
+        x_edge = traj_edge[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_edge = traj_edge[i, :, 1].detach().cpu().to(torch.float32).numpy()
+
+        # Plot all three
+        ax_graph.plot(
+            -np.insert(y_gt_traj, 0, 0.0),
+            np.insert(x_gt_traj, 0, 0.0),
+            linewidth=3.0,
+            markersize=8,
+            marker='o',
+            color='green',
+            label="gt"
+        )
+
+        ax_graph.plot(
+            -np.insert(y_vlm, 0, 0.0),
+            np.insert(x_vlm, 0, 0.0),
+            linewidth=3.0,
+            markersize=8,
+            marker='o',
+            color='red',
+            label="vlm_raw"
+        )
+
+        ax_graph.plot(
+            -np.insert(y_edge, 0, 0.0),
+            np.insert(x_edge, 0, 0.0),
+            linewidth=4.0,
+            markersize=10,
+            marker='o',
+            color='blue',
+            label="edge_corrected"
+        )
+
+        # goal marker
+        ax_graph.plot(-ygt, xgt, marker='*', color='black', markersize=16, label="goal")
         ax_graph.text(2.5, -0.2, str(task_id))
 
         mask_type = int(task_id)
@@ -805,7 +852,7 @@ def visualize_train(
             ax_graph.annotate(lan_prompts[i], xy=(-8.0, 0.0), xytext=(-20, 20), fontsize=12, textcoords='offset points')
                                                  
         # set title
-        ax_graph.set_title(f"est. trajectory (normzlied dim.)")
+        ax_graph.set_title("GT vs Raw VLM vs Edge-corrected trajectory")
         ax_graph.set_xlim(-10.0, 10.0)
         ax_graph.set_ylim(-0.1, 15.0)
         ax_graph.legend(loc='best')                  
@@ -868,9 +915,10 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
         set_seed(cfg.inference_seed)
     
     assert cfg.use_lora, "Only LoRA fine-tuning is supported. Please set --use_lora=True!"
-
+    
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
+    chkpt_match = re.search(r"--(\d+)_chkpt", cfg.vla_path)
 
     if cfg.vla_path == "openvla/openvla-7b": #from OpenVLA checkpoints
         cfg.resume = False
@@ -878,7 +926,12 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
     elif cfg.vla_path == "./AsyncVLA_release": #from AsyncVLA checkpoints
         cfg.resume = True     
         cfg.resume_step = 750000
-                                  
+
+    if chkpt_match:
+        cfg.resume = True
+        cfg.resume_step = int(chkpt_match.group(1))
+        print(f"Resume: {cfg.resume}, Resume Step: {cfg.resume_step}")
+
     # Get experiment run ID
     run_id = get_run_id(cfg)
 
