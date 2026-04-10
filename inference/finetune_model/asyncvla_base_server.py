@@ -13,8 +13,11 @@ import base64
 import io
 import json
 import os
+import sys
 import select
 import socket
+import time
+import random
 from typing import Optional, Type
 
 import numpy as np
@@ -50,17 +53,22 @@ from prismatic.vla.constants import (
     POSE_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
 )
+
+sys.path.extend([
+    "../Learning-to-Drive-Anywhere-with-MBRA/train/"
+])
+
 from prismatic.models.small_head import Proj_Actiontokens
 
 
 goal_image_paths = {
-    "forklift": "./goal_img/forklift.png",
-    "marker1": "./goal_img/marker1.png",
-    "marker2": "./goal_img/marker2.png",
-    "marker3": "./goal_img/marker3.png",
-    "marker4": "./goal_img/marker4.png",
-    "marker5": "./goal_img/marker5.png",
-    "pallet": "./goal_img/pallet.png",
+    "forklift": "./inference/finetune_model/goal_img/forklift.png",
+    "marker1": "./inference/finetune_model/goal_img/marker1.png",
+    "marker2": "./inference/finetune_model/goal_img/marker2.png",
+    "marker3": "./inference/finetune_model/goal_img/marker3.png",
+    "marker4": "./inference/finetune_model/goal_img/marker4.png",
+    "marker5": "./inference/finetune_model/goal_img/marker5.png",
+    "pallet": "./inference/finetune_model/goal_img/pallet.png",
 }
 
 pose_goal = True
@@ -207,8 +215,8 @@ def init_module(
 
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = "./AsyncVLA_release"
-    resume_step: Optional[int] = 750000
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA/AsyncVLA_release--790000_chkpt-merged/"
+    resume_step: Optional[int] = 790000
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
@@ -537,6 +545,8 @@ def main():
                 server.send_message({"ok": True, "msg": "pong"})
 
             elif cmd == "infer_base":
+                t_recv = time.time()
+                
                 current_image_PIL = base.decode_image_b64(msg["image_b64"])
                 goal_pose_loc_norm = np.asarray(msg["goal_pose_loc_norm"], dtype=np.float32)
 
@@ -553,13 +563,19 @@ def main():
                     goal_pose_loc_norm=goal_pose_loc_norm,
                     lan_inst_prompt=lan_inst_prompt,
                 )
-                server.send_message(
-                    {
-                        "ok": True,
-                        "timestamp": float(msg["timestamp"]),
-                        **out,
-                    }
-                )
+                
+                # inference 후 랜덤 delay
+                elapsed = time.time() - t_recv
+                target = random.uniform(0.10, 0.60) # network latency 재현 
+                remaining = target - elapsed
+                if remaining > 0:
+                    time.sleep(remaining)
+
+                server.send_message({
+                    "ok": True,
+                    "timestamp": float(msg["timestamp"]),
+                    **out,
+                })
 
             else:
                 server.send_message({"ok": False, "error": f"unknown cmd: {cmd}"})
