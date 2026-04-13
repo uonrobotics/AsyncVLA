@@ -730,6 +730,8 @@ class GotoSim_Dataset(Dataset):
                 traj[g_obs]["map_pose"]["y"],
                 traj[g_obs]["map_pose"]["yaw"],
             )
+            max_action_goal_idx = g_obs
+            
         else:
             # destination: keep world goal as final destination, but use delayed-aligned goal image
             g_obs = max(0, g - lt)
