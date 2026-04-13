@@ -541,27 +541,44 @@ def run_forward_pass(
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)
         
-        # For visualization of raw VLA predictions (without edge adapter correction), we also compute the predicted actions without gradient tracking
+        # For visualization of base VLA predictions 
         with torch.no_grad():
-            raw_predicted_actions = action_head.module.predict_action(
+            base_predicted_actions = action_head.module.predict_action(
                 actions_hidden_states.detach(),
                 modality_id.to(torch.bfloat16).to(device_id)
             )
 
-        # Predict action
         if TRAIN_HEAD:
-            projected_actions = action_proj.module.predict_action(actions_hidden_states, modality_id.to(torch.bfloat16).to(device_id))
+            projected_actions = action_proj.module.predict_action(
+                actions_hidden_states,
+                modality_id.to(torch.bfloat16).to(device_id)
+            )
+
+            # current-corrected
             predicted_dactions = shead(img_cur, img_past, projected_actions)
+
+            # past-corrected
+            predicted_dactions_past = shead(img_past, img_past, projected_actions)
+
         else:
             with torch.no_grad():
-                projected_actions = action_proj.module.predict_action(actions_hidden_states.detach(), modality_id.to(torch.bfloat16).to(device_id))
+                projected_actions = action_proj.module.predict_action(
+                    actions_hidden_states.detach(),
+                    modality_id.to(torch.bfloat16).to(device_id)
+                )
+
+                # current-corrected
                 predicted_dactions = shead(img_cur, img_past, projected_actions)
+
+                # past-corrected
+                predicted_dactions_past = shead(img_past, img_past, projected_actions)
 
         action_ref = ground_truth_actions
         lan_bool = (batch["goal_mask_select"] == 7)|(batch["goal_mask_select"] == 8) #object loss is only for the LeLaN dataset
 
         daction_ref = pose_to_delta(action_ref)
         predicted_actions = delta_to_pose(predicted_dactions)
+        predicted_actions_past = delta_to_pose(predicted_dactions_past)
 
         action_orig = torch.zeros(Bsize, 1, 4)
         action_orig[:, :, 2] = torch.cos(torch.tensor(0.0))
@@ -600,13 +617,15 @@ def run_forward_pass(
 
         if VISUALIZE == True:
             visualize_train(
-                batch["img_PIL"],
-                batch["gimg_PIL"],              
+                batch["p_image"],   # past IMG
+                batch["c_image"],   # curr IMG
+                batch["gimg_PIL"],  # goal PIL           
                 obj_pose_norm.detach().cpu(),   
                 batch["goal_pose"].detach().cpu(),
                 ground_truth_actions.detach().cpu(),     # GT
-                raw_predicted_actions.detach().cpu(),    # raw VLM
-                predicted_actions.detach().cpu(),        # edge-adapter corrected
+                base_predicted_actions.detach().cpu(),   # raw VLM
+                predicted_actions_past.detach().cpu(),   # edge-adapter corrected (past-corrected)
+                predicted_actions.detach().cpu(),        # edge-adapter corrected (current-corrected)
                 batch["goal_mask_select"], 
                 batch["lan_prompts"],         
                 "train",   
@@ -745,14 +764,58 @@ def save_training_checkpoint(
 def to_numpy(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().cpu().to(torch.float32).numpy()
 
+def to_imshow_image(x):
+    """
+    Convert PIL / torch.Tensor / numpy array into an HWC uint8 image for matplotlib.
+    Handles CHW tensors and cases like (18, 96, 96) by taking the first 3 channels.
+    """
+    if isinstance(x, Image.Image):
+        return np.array(x).astype(np.uint8)
+
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+
+        # Remove batch dim if accidentally present
+        if x.ndim == 4 and x.shape[0] == 1:
+            x = x[0]
+
+        # CHW -> HWC
+        if x.ndim == 3 and x.shape[0] not in [96, 224] and x.shape[0] >= 3:
+            x = x[:3]                    # take first 3 channels if there are many
+            x = x.permute(1, 2, 0)       # CHW -> HWC
+
+        # HW stays HW
+        x = x.to(torch.float32).numpy()
+
+        # If normalized to [0,1], scale to [0,255]
+        if x.max() <= 1.0:
+            x = x * 255.0
+
+        x = np.clip(x, 0, 255).astype(np.uint8)
+        return x
+
+    x = np.array(x)
+
+    if x.ndim == 3 and x.shape[0] >= 3 and x.shape[-1] not in [3, 4]:
+        x = np.transpose(x[:3], (1, 2, 0))
+
+    if x.dtype != np.uint8:
+        if x.max() <= 1.0:
+            x = x * 255.0
+        x = np.clip(x, 0, 255).astype(np.uint8)
+
+    return x
+
 def visualize_train(
-    batch_current_PIL: torch.Tensor,
+    batch_past_img: torch.Tensor,
+    batch_curr_img: torch.Tensor,
     batch_goal_PIL: torch.Tensor,  
     goal_pos_lan: torch.Tensor, 
     goal_pos: torch.Tensor, 
     traj_gt: torch.Tensor,
-    traj_vlm_raw: torch.Tensor,
-    traj_edge: torch.Tensor,
+    traj_vlm_base: torch.Tensor,
+    traj_edge_past: torch.Tensor,
+    traj_edge_curr: torch.Tensor,
     goal_mask_select: torch.Tensor,
     lan_prompts: list,
     eval_type: str,    
@@ -782,14 +845,17 @@ def visualize_train(
     
     for i in range(num_images_log):
         fig = plt.figure(figsize=(34, 16), dpi=80)
-        gs = fig.add_gridspec(2,2)
-        ax_graph = fig.add_subplot(gs[0:2, 1:2])      
-        ax_ob = fig.add_subplot(gs[0:1, 0:1])
-        ax_goal = fig.add_subplot(gs[1:2, 0:1])   
+        gs = fig.add_gridspec(3,2)
+        ax_graph = fig.add_subplot(gs[0:3, 1:2])      
+        
+        ax_past_obs = fig.add_subplot(gs[0:1, 0:1])
+        ax_curr_obs = fig.add_subplot(gs[1:2, 0:1])
+        ax_goal = fig.add_subplot(gs[2:3, 0:1])
+            
+        ax_past_obs.imshow(to_imshow_image(batch_past_img[i]))
+        ax_curr_obs.imshow(to_imshow_image(batch_curr_img[i]))
+        ax_goal.imshow(np.array(batch_goal_PIL[i]).astype(np.uint8))
 
-        ax_ob.imshow(np.array(batch_current_PIL[i]).astype(np.uint8))
-        ax_goal.imshow(np.array(batch_goal_PIL[i]).astype(np.uint8))                  
-                                            
         xgt = to_numpy(goal_pos_gt[i,0])
         ygt = to_numpy(goal_pos_gt[i,1])
         task_id = goal_mask_select[i].item()
@@ -799,42 +865,60 @@ def visualize_train(
         y_gt_traj = traj_gt[i, :, 1].detach().cpu().to(torch.float32).numpy()
 
         # Raw VLM trajectory
-        x_vlm = traj_vlm_raw[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_vlm = traj_vlm_raw[i, :, 1].detach().cpu().to(torch.float32).numpy()
+        x_vlm = traj_vlm_base[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_vlm = traj_vlm_base[i, :, 1].detach().cpu().to(torch.float32).numpy()
+        
+        # Edge-adapter corrected trajectory using past image
+        x_edge_past = traj_edge_past[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_edge_past = traj_edge_past[i, :, 1].detach().cpu().to(torch.float32).numpy()
+        
+        # Edge-adapter corrected trajectory using current image
+        x_edge_current = traj_edge_curr[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_edge_current = traj_edge_curr[i, :, 1].detach().cpu().to(torch.float32).numpy()
 
-        # Edge-adapter corrected trajectory
-        x_edge = traj_edge[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_edge = traj_edge[i, :, 1].detach().cpu().to(torch.float32).numpy()
 
-        # Plot all three
+        # GT
         ax_graph.plot(
             -np.insert(y_gt_traj, 0, 0.0),
             np.insert(x_gt_traj, 0, 0.0),
-            linewidth=3.0,
-            markersize=8,
+            linewidth=1.2,
+            markersize=3,
             marker='o',
-            color='green',
+            color='red',
             label="gt"
         )
 
+        # base 
         ax_graph.plot(
             -np.insert(y_vlm, 0, 0.0),
             np.insert(x_vlm, 0, 0.0),
-            linewidth=3.0,
-            markersize=8,
-            marker='o',
-            color='red',
-            label="vlm_raw"
-        )
-
-        ax_graph.plot(
-            -np.insert(y_edge, 0, 0.0),
-            np.insert(x_edge, 0, 0.0),
-            linewidth=4.0,
-            markersize=10,
+            linewidth=1.2,
+            markersize=3,
             marker='o',
             color='blue',
-            label="edge_corrected"
+            label="vlm_raw"
+        )
+        
+        # Edge corrected with past image
+        ax_graph.plot(
+            -np.insert(y_edge_past, 0, 0.0),
+            np.insert(x_edge_past, 0, 0.0),
+            linewidth=1.5,
+            markersize=5,
+            marker='o',
+            color='purple',
+            label="edge_past"
+        )
+        
+        # Edge corrected with current image
+        ax_graph.plot(
+            -np.insert(y_edge_current, 0, 0.0),
+            np.insert(x_edge_current, 0, 0.0),
+            linewidth=1.8,
+            markersize=6,
+            marker='o',
+            color='pink',
+            label="edge_current"
         )
 
         # goal marker
@@ -852,12 +936,13 @@ def visualize_train(
             ax_graph.annotate(lan_prompts[i], xy=(-8.0, 0.0), xytext=(-20, 20), fontsize=12, textcoords='offset points')
                                                  
         # set title
-        ax_graph.set_title("GT vs Raw VLM vs Edge-corrected trajectory")
+        ax_graph.set_title("GT vs Base VLM vs Edge-current vs Edge-past trajectory")
         ax_graph.set_xlim(-10.0, 10.0)
         ax_graph.set_ylim(-0.1, 15.0)
         ax_graph.legend(loc='best')                  
-        ax_ob.set_title("Egocentric current image", fontsize=18)
-        ax_goal.set_title("Egocentric goal image", fontsize=18)                     
+        ax_past_obs.set_title("Egocentric past image", fontsize=12)
+        ax_curr_obs.set_title("Egocentric current image", fontsize=12)
+        ax_goal.set_title("Egocentric goal image", fontsize=12)                     
                         
         # make the plot large
         fig.set_size_inches(18.5, 10.5)
