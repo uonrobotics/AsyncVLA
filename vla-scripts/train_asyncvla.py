@@ -7,7 +7,7 @@ Train or finetune AsyncVLA
 # ==============================
 # Configuration Flags
 # ==============================
-TRAIN_BASE = True   # True: training BASE VLA (if True, you need H100 or H200.)
+TRAIN_BASE = False   # True: training BASE VLA (if True, you need H100 or H200.)
 TRAIN_HEAD = True    # True: training Edge adapter and token projector
 VISUALIZE = False    # True: save visualization images of policy performance
 
@@ -374,11 +374,15 @@ def init_module(
 
     module = module_class(**module_args)
     count_parameters(module, module_name)
-
-    #if cfg.resume and module_name != "action_proj":
-    if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
-        module.load_state_dict(state_dict)
+    
+    if TRAIN_HEAD and not TRAIN_BASE:
+        if cfg.resume and module_name != "action_proj":
+            state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+            module.load_state_dict(state_dict)
+    else:
+        if cfg.resume:
+            state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+            module.load_state_dict(state_dict)
         
     if to_bf16:
         module = module.to(torch.bfloat16)
@@ -540,79 +544,39 @@ def run_forward_pass(
             .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)
-        
+
+        # Predict action
         if TRAIN_HEAD:
-            projected_actions = action_proj.module.predict_action(
-                actions_hidden_states,
-                modality_id.to(torch.bfloat16).to(device_id)
-            )
-
-            # current-corrected
+            projected_actions = action_proj.module.predict_action(actions_hidden_states, modality_id.to(torch.bfloat16).to(device_id))
             predicted_dactions = shead(img_cur, img_past, projected_actions)
-
-            # past-corrected
-            predicted_dactions_past = shead(img_past, img_past, projected_actions)
-
         else:
             with torch.no_grad():
-                projected_actions = action_proj.module.predict_action(
-                    actions_hidden_states.detach(),
-                    modality_id.to(torch.bfloat16).to(device_id)
-                )
-
-                # current-corrected
+                projected_actions = action_proj.module.predict_action(actions_hidden_states.detach(), modality_id.to(torch.bfloat16).to(device_id))
                 predicted_dactions = shead(img_cur, img_past, projected_actions)
-
-                # past-corrected
-                predicted_dactions_past = shead(img_past, img_past, projected_actions)
 
         action_ref = ground_truth_actions
         lan_bool = (batch["goal_mask_select"] == 7)|(batch["goal_mask_select"] == 8) #object loss is only for the LeLaN dataset
-        not_lan_bool = ~lan_bool
 
         daction_ref = pose_to_delta(action_ref)
         predicted_actions = delta_to_pose(predicted_dactions)
-        predicted_actions_past = delta_to_pose(predicted_dactions_past)
 
         action_orig = torch.zeros(Bsize, 1, 4)
         action_orig[:, :, 2] = torch.cos(torch.tensor(0.0))
         action_orig[:, :, 3] = torch.sin(torch.tensor(0.0))        
         sm_ref = torch.cat((action_orig.to(torch.bfloat16).to(device_id), predicted_actions[:,0:-1]), dim=1)
 
-        if not_lan_bool.any():
-            L2_daction = torch.nn.MSELoss()(daction_ref[not_lan_bool], predicted_dactions[not_lan_bool])
-            L2_action = torch.nn.MSELoss()(action_ref[not_lan_bool], predicted_actions[not_lan_bool])
+        loss = 0.5*torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool]) + 0.5*15.0*torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool]) + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(sm_ref, predicted_actions)
 
-            L2_daction_metric = L2_daction
-            L2_action_metric = L2_action
-        else:
-            L2_daction = torch.zeros((), device=device_id, dtype=predicted_dactions.dtype)
-            L2_action = torch.zeros((), device=device_id, dtype=predicted_actions.dtype)
-
-            L2_daction_metric = torch.tensor(float("nan"), device=device_id)
-            L2_action_metric = torch.tensor(float("nan"), device=device_id)
-
-        if lan_bool.any():
-            L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool])
-            L2_obj_metric = L2_obj
-        else:
-            L2_obj = torch.zeros((), device=device_id, dtype=predicted_actions.dtype)
-            L2_obj_metric = torch.tensor(float("nan"), device=device_id)
-
+        L2_daction = torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool])
+        L2_action = torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool])
+        L2_obj = torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool])
         L2_smooth = torch.nn.MSELoss()(sm_ref, predicted_actions)
-        
-        loss = 0.5*L2_action + 0.5*15.0*L2_daction + 0.1*L2_obj + 0.1*L2_smooth
             
         loss_list = []
         task_list = []
         for icl in range(9):
             mask_task = batch["goal_mask_select"] == icl
-
-            if mask_task.any():
-                L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task])
-            else:
-                L2_action_task = torch.tensor(float("nan"), device=device_id)
-
+            L2_action_task = torch.nn.MSELoss()(action_ref[mask_task], predicted_actions[mask_task])
             loss_list.append(L2_action_task)
             task_list.append(torch.sum(mask_task.float()))
 
@@ -633,14 +597,12 @@ def run_forward_pass(
 
         if VISUALIZE == True:
             visualize_train(
-                batch["p_image"],   # past IMG
-                batch["c_image"],   # curr IMG
-                batch["gimg_PIL"],  # goal PIL           
+                batch["img_PIL"],
+                batch["gimg_PIL"],              
                 obj_pose_norm.detach().cpu(),   
                 batch["goal_pose"].detach().cpu(),
-                ground_truth_actions.detach().cpu(),     # GT
-                predicted_actions_past.detach().cpu(),   # edge-adapter corrected (past-corrected)
-                predicted_actions.detach().cpu(),        # edge-adapter corrected (current-corrected)
+                ground_truth_actions.detach().cpu(), 
+                predicted_actions.detach().cpu(),   
                 batch["goal_mask_select"], 
                 batch["lan_prompts"],         
                 "train",   
@@ -648,8 +610,8 @@ def run_forward_pass(
                 idrun,                              
                 1,                  
                 False,                               
-                )      
-                                              
+                )                                        
+
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
     return loss, metrics
 
@@ -779,57 +741,13 @@ def save_training_checkpoint(
 def to_numpy(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().cpu().to(torch.float32).numpy()
 
-def to_imshow_image(x):
-    """
-    Convert PIL / torch.Tensor / numpy array into an HWC uint8 image for matplotlib.
-    Handles CHW tensors and cases like (18, 96, 96) by taking the first 3 channels.
-    """
-    if isinstance(x, Image.Image):
-        return np.array(x).astype(np.uint8)
-
-    if torch.is_tensor(x):
-        x = x.detach().cpu()
-
-        # Remove batch dim if accidentally present
-        if x.ndim == 4 and x.shape[0] == 1:
-            x = x[0]
-
-        # CHW -> HWC
-        if x.ndim == 3 and x.shape[0] not in [96, 224] and x.shape[0] >= 3:
-            x = x[:3]                    # take first 3 channels if there are many
-            x = x.permute(1, 2, 0)       # CHW -> HWC
-
-        # HW stays HW
-        x = x.to(torch.float32).numpy()
-
-        # If normalized to [0,1], scale to [0,255]
-        if x.max() <= 1.0:
-            x = x * 255.0
-
-        x = np.clip(x, 0, 255).astype(np.uint8)
-        return x
-
-    x = np.array(x)
-
-    if x.ndim == 3 and x.shape[0] >= 3 and x.shape[-1] not in [3, 4]:
-        x = np.transpose(x[:3], (1, 2, 0))
-
-    if x.dtype != np.uint8:
-        if x.max() <= 1.0:
-            x = x * 255.0
-        x = np.clip(x, 0, 255).astype(np.uint8)
-
-    return x
-
 def visualize_train(
-    batch_past_img: torch.Tensor,
-    batch_curr_img: torch.Tensor,
+    batch_current_PIL: torch.Tensor,
     batch_goal_PIL: torch.Tensor,  
     goal_pos_lan: torch.Tensor, 
     goal_pos: torch.Tensor, 
-    traj_gt: torch.Tensor,
-    traj_edge_past: torch.Tensor,
-    traj_edge_curr: torch.Tensor,
+    traj_raw: torch.Tensor,
+    est_traj: torch.Tensor,
     goal_mask_select: torch.Tensor,
     lan_prompts: list,
     eval_type: str,    
@@ -859,70 +777,26 @@ def visualize_train(
     
     for i in range(num_images_log):
         fig = plt.figure(figsize=(34, 16), dpi=80)
-        gs = fig.add_gridspec(3,2)
-        ax_graph = fig.add_subplot(gs[0:3, 1:2])      
-        
-        ax_past_obs = fig.add_subplot(gs[0:1, 0:1])
-        ax_curr_obs = fig.add_subplot(gs[1:2, 0:1])
-        ax_goal = fig.add_subplot(gs[2:3, 0:1])
-            
-        ax_past_obs.imshow(to_imshow_image(batch_past_img[i]))
-        ax_curr_obs.imshow(to_imshow_image(batch_curr_img[i]))
-        ax_goal.imshow(np.array(batch_goal_PIL[i]).astype(np.uint8))
+        gs = fig.add_gridspec(2,2)
+        ax_graph = fig.add_subplot(gs[0:2, 1:2])      
+        ax_ob = fig.add_subplot(gs[0:1, 0:1])
+        ax_goal = fig.add_subplot(gs[1:2, 0:1])   
 
+        ax_ob.imshow(np.array(batch_current_PIL[i]).astype(np.uint8))
+        ax_goal.imshow(np.array(batch_goal_PIL[i]).astype(np.uint8))                  
+                                            
         xgt = to_numpy(goal_pos_gt[i,0])
         ygt = to_numpy(goal_pos_gt[i,1])
         task_id = goal_mask_select[i].item()
             
-        # GT trajectory
-        x_gt_traj = traj_gt[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_gt_traj = traj_gt[i, :, 1].detach().cpu().to(torch.float32).numpy()
+        x_raw = traj_raw[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_raw = traj_raw[i, :, 1].detach().cpu().to(torch.float32).numpy()       
+        x_est = est_traj[i, :, 0].detach().cpu().to(torch.float32).numpy()
+        y_est = est_traj[i, :, 1].detach().cpu().to(torch.float32).numpy()          
 
-        # Edge-adapter corrected trajectory using past image
-        x_edge_past = traj_edge_past[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_edge_past = traj_edge_past[i, :, 1].detach().cpu().to(torch.float32).numpy()
-        
-        # Edge-adapter corrected trajectory using current image
-        x_edge_current = traj_edge_curr[i, :, 0].detach().cpu().to(torch.float32).numpy()
-        y_edge_current = traj_edge_curr[i, :, 1].detach().cpu().to(torch.float32).numpy()
-
-
-        # GT
-        ax_graph.plot(
-            -np.insert(y_gt_traj, 0, 0.0),
-            np.insert(x_gt_traj, 0, 0.0),
-            linewidth=1.2,
-            markersize=3,
-            marker='o',
-            color='red',
-            label="gt"
-        )
-
-        
-        # Edge corrected with past image
-        ax_graph.plot(
-            -np.insert(y_edge_past, 0, 0.0),
-            np.insert(x_edge_past, 0, 0.0),
-            linewidth=1.5,
-            markersize=5,
-            marker='o',
-            color='purple',
-            label="edge_past"
-        )
-        
-        # Edge corrected with current image
-        ax_graph.plot(
-            -np.insert(y_edge_current, 0, 0.0),
-            np.insert(x_edge_current, 0, 0.0),
-            linewidth=1.8,
-            markersize=6,
-            marker='o',
-            color='pink',
-            label="edge_current"
-        )
-
-        # goal marker
-        ax_graph.plot(-ygt, xgt, marker='*', color='black', markersize=16, label="goal")
+        ax_graph.plot(-np.insert(y_est, 0, 0.0), np.insert(x_est, 0, 0.0), linewidth=4.0, markersize=12, marker='o', color='blue', label="est")                                                      
+        ax_graph.plot(-y_raw, x_raw, marker = 'o', color='red', label="raw")                                             
+        ax_graph.plot(-ygt, xgt, marker = '*', color='red')   
         ax_graph.text(2.5, -0.2, str(task_id))
 
         mask_type = int(task_id)
@@ -936,13 +810,12 @@ def visualize_train(
             ax_graph.annotate(lan_prompts[i], xy=(-8.0, 0.0), xytext=(-20, 20), fontsize=12, textcoords='offset points')
                                                  
         # set title
-        ax_graph.set_title("GT vs Base VLM vs Edge-current vs Edge-past trajectory")
+        ax_graph.set_title(f"est. trajectory (normzlied dim.)")
         ax_graph.set_xlim(-10.0, 10.0)
         ax_graph.set_ylim(-0.1, 15.0)
         ax_graph.legend(loc='best')                  
-        ax_past_obs.set_title("Egocentric past image", fontsize=12)
-        ax_curr_obs.set_title("Egocentric current image", fontsize=12)
-        ax_goal.set_title("Egocentric goal image", fontsize=12)                     
+        ax_ob.set_title("Egocentric current image", fontsize=18)
+        ax_goal.set_title("Egocentric goal image", fontsize=18)                     
                         
         # make the plot large
         fig.set_size_inches(18.5, 10.5)
@@ -1491,138 +1364,124 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
     
                                                                   
     log_count = 0
-    epoch = 0
-
-    if TRAIN_BASE:
-        print("setting up training mode")
-        vla.train()
-        if TRAIN_HEAD:
-            action_proj.train()
-            shead.train()
-        else:
-            action_proj.eval()
-            shead.eval()
-    else:
-        print("setting up eval (Local PC coding) mode")
-        vla.eval()
-        action_head.eval()
-        #action_proj.eval()
-        pose_projector.eval()
-        if TRAIN_HEAD:
-            action_proj.train()
-            shead.train()
-        else:
-            action_proj.eval()
-            shead.eval()
-
-    optimizer.zero_grad()
-
-    # 처음 epoch seed 설정
-    for sampler in samplers:
-        sampler.set_epoch(epoch)
-
-    # 첫 iterator 생성
-    iters = [iter(train_loader_gotosim)]
-
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
-        for batch_idx in range(cfg.max_steps):
-            batches = []
-
-            for i, it in enumerate(iters):
-                try:
-                    batch = next(it)
-                except StopIteration:
-                    print(f"Epoch {epoch} finished. Restarting iterator.")
-                    epoch += 1
-                    for sampler in samplers:
-                        sampler.set_epoch(epoch)
-
-                    iters[i] = iter([train_loader_gotosim][i])
-                    batch = next(iters[i])
-
-                batches.append(batch)
-
-            #Merging multiple datasets
-            merged_batch = merge_batches_padding(batches, processor.tokenizer.pad_token_id, IGNORE_INDEX, tokenizer_max_length)                  
-
-
-            # Compute training metrics and loss
-            loss, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head,
-                action_proj=action_proj,
-                shead=shead,
-                pose_projector=pose_projector,
-                batch=merged_batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                num_patches=NUM_PATCHES,
-                idrun=batch_idx,
-            )
-
-            # Normalize loss to account for gradient accumulation
-            normalized_loss = loss / cfg.grad_accumulation_steps
-
-            # Backward pass
+    for epoch in range(1):
+        for sampler in samplers:
+            sampler.set_epoch(epoch)
+                
+        with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
             if TRAIN_BASE:
-                normalized_loss.backward()
-            elif TRAIN_HEAD:
-                normalized_loss.backward()
+                print("setting up training mode")
+                vla.train()
+                if TRAIN_HEAD:
+                    action_proj.train()
+                    shead.train()
+                else:
+                    action_proj.eval()
+                    shead.eval()
+            else:
+                print("setting up eval (Local PC coding) mode")
+                vla.eval()
+                action_head.eval()
+                #action_proj.eval()
+                pose_projector.eval()
+                if TRAIN_HEAD:
+                    action_proj.train()
+                    shead.train()          
+                else:
+                    action_proj.eval()
+                    shead.eval()                                  
+                
+            optimizer.zero_grad()
+            for batch_idx in range(cfg.max_steps):
+                batches = []
+                for i, it in enumerate(iters):
+                    try:
+                        batch = next(it)
+                    except StopIteration:
+                        # iters[i] = iter([train_loader_gnm, train_loader_lelan, train_loader_sacson][i])
+                        iters[i] = iter([train_loader_gotosim][i])
+                        batch = next(iters[i])
+                    batches.append(batch)
+                
+                #Merging multiple datasets
+                merged_batch = merge_batches_padding(batches, processor.tokenizer.pad_token_id, IGNORE_INDEX, tokenizer_max_length)                  
 
-            # Store recent train metrics
-            for metric_name, value in metrics.items():
-                if metric_name in recent_metrics:
-                    recent_metrics[metric_name].append(value)
-
-            # Compute gradient step index
-            gradient_step_idx = log_count // cfg.grad_accumulation_steps
-            log_count += 1
-
-            # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
-
-            smoothened_metrics = compute_smoothened_metrics(recent_metrics)
-            if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
-
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
-                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
-
-            if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
-                # Log the learning rate
-                # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
-
-            # Optimizer and LR scheduler step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                progress.update()
-
-            # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:            
-                save_training_checkpoint(
-                    cfg=cfg,
-                    run_dir=run_dir,
-                    log_step=log_step,
+                # Compute training metrics and loss
+                loss, metrics = run_forward_pass(
                     vla=vla,
-                    processor=processor,
-                    pose_projector=pose_projector,
                     action_head=action_head,
                     action_proj=action_proj,
                     shead=shead,
-                    distributed_state=distributed_state,
+                    pose_projector=pose_projector,
+                    batch=merged_batch,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    num_patches=NUM_PATCHES,
+                    idrun=batch_idx,
                 )
+                # Normalize loss to account for gradient accumulation
+                normalized_loss = loss / cfg.grad_accumulation_steps
+                        
+                # Backward pass
+                if TRAIN_BASE:
+                    normalized_loss.backward()
+                elif TRAIN_HEAD:
+                    normalized_loss.backward()
+
+                # Store recent train metrics
+                for metric_name, value in metrics.items():
+                    if metric_name in recent_metrics:
+                        recent_metrics[metric_name].append(value)
+
+                # Compute gradient step index
+                gradient_step_idx = log_count // cfg.grad_accumulation_steps
+                log_count += 1
+
+                # Push Metrics to W&B (every wandb_log_freq gradient steps)
+                log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+
+                smoothened_metrics = compute_smoothened_metrics(recent_metrics)
+                if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+                    log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+
+                # [If applicable] Linearly warm up learning rate from 10% to 100% of original
+                if cfg.lr_warmup_steps > 0:
+                    lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                    current_lr = original_lr * (0.1 + 0.9 * lr_progress)
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = current_lr
+
+                if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
+                    # Log the learning rate
+                    # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
+                    wandb.log(
+                        {
+                            "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        },
+                        step=log_step,
+                    )
+
+                # Optimizer and LR scheduler step
+                if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    progress.update()
+
+                # Save model checkpoint: either keep latest checkpoint only or all checkpoints
+                if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:            
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        run_dir=run_dir,
+                        log_step=log_step,
+                        vla=vla,
+                        processor=processor,
+                        pose_projector=pose_projector,
+                        action_head=action_head,
+                        action_proj=action_proj,
+                        shead=shead,
+                        distributed_state=distributed_state,
+                    )
 
 if __name__ == "__main__":
     train_asyncvla()
