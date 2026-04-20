@@ -565,7 +565,9 @@ def run_forward_pass(
         action_orig[:, :, 3] = torch.sin(torch.tensor(0.0))        
         sm_ref = torch.cat((action_orig.to(torch.bfloat16).to(device_id), predicted_actions[:,0:-1]), dim=1)
 
-        loss = 0.5*torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool]) + 0.5*15.0*torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool]) + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(sm_ref, predicted_actions)
+        loss = 0.5*torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool]) \
+                + 0.5*15.0*torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool]) \
+                + 0.1*torch.nn.MSELoss()(obj_pose_norm[lan_bool], predicted_actions[:,-1,0:2][lan_bool]) + 0.1*torch.nn.MSELoss()(sm_ref, predicted_actions)
 
         L2_daction = torch.nn.MSELoss()(daction_ref[~lan_bool], predicted_dactions[~lan_bool])
         L2_action = torch.nn.MSELoss()(action_ref[~lan_bool], predicted_actions[~lan_bool])
