@@ -243,12 +243,8 @@ def init_module(
 
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = (
-        "/nas/sujinkim/model/goto/sim/20260323_224/"
-        "AsyncVLA+handle_nan+official_training_script/"
-        "AsyncVLA_release--825000_chkpt-merged/"
-    )
-    resume_step: Optional[int] = 825000
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP2+more_delay+no_lan/omnivla-original-balance--550000_chkpt-merged/"
+    resume_step: Optional[int] = 550000
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
@@ -601,6 +597,7 @@ def main():
             elif cmd == "infer_base":
                 t_recv = time.time()
                 obs_timestamp = float(msg["timestamp"])
+                episode_idx = msg.get("episode_idx", -1)
 
                 try:
                     current_image_PIL = base.decode_image_b64(msg["image_b64"])
@@ -631,6 +628,7 @@ def main():
                     ok = server.send_message({
                         "ok": True,
                         "timestamp": obs_timestamp,  # echo original timestamp for buffer matching
+                        "episode_idx": msg.get("episode_idx"),
                         **out,
                     })
                     if not ok:
@@ -647,7 +645,12 @@ def main():
 
                 except Exception as e:
                     print(f"[BASE SERVER] infer_base error: {e}")
-                    server.send_message({"ok": False, "error": str(e), "timestamp": obs_timestamp})
+                    server.send_message({
+                        "ok": False,
+                        "error": str(e),
+                        "timestamp": obs_timestamp,
+                        "episode_idx": msg.get("episode_idx"),
+                    })
 
             else:
                 server.send_message({"ok": False, "error": f"unknown cmd: {cmd}"})
