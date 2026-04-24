@@ -34,6 +34,8 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yaml
 
@@ -45,7 +47,120 @@ sys.path.extend([
     "../Learning-to-Drive-Anywhere-with-MBRA/train/"
 ])
 
+# prismatic/__init__.py 와 prismatic/vla/__init__.py 는 학습용 heavy import를
+# 포함하므로, edge에서 필요한 small_head / constants 만 로드하도록 stub으로 우회
+import types as _types
+_prismatic_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+for _pkg, _subpath in [
+    ("prismatic",         "prismatic"),
+    ("prismatic.vla",     "prismatic/vla"),
+    ("prismatic.models",  "prismatic/models"),
+]:
+    if _pkg not in sys.modules:
+        _m = _types.ModuleType(_pkg)
+        _m.__path__ = [os.path.join(_prismatic_root, _subpath)]
+        _m.__package__ = _pkg
+        sys.modules[_pkg] = _m
+
 from prismatic.models.small_head import Edge_adapter
+
+
+# ===============================================================
+# AMCL / TF helpers
+# ===============================================================
+def quat_xyzw_to_yaw(x: float, y: float, z: float, w: float) -> float:
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+class AMCLPoseProvider:
+    """
+    Provides robot pose via TF map→base_link (AMCL-corrected).
+    Camera images are obtained separately from IsaacSim socket.
+    """
+
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from tf2_ros import Buffer, TransformListener
+
+        self._lock = threading.Lock()
+        self._pose: Optional[dict] = None
+
+        provider = self
+
+        class _InnerNode(Node):
+            def __init__(inner):
+                super().__init__("amcl_pose_provider")
+                inner.tf_buffer = Buffer()
+                inner.tf_listener = TransformListener(inner.tf_buffer, inner)
+
+                from geometry_msgs.msg import PoseWithCovarianceStamped
+                inner._initialpose_pub = inner.create_publisher(
+                    PoseWithCovarianceStamped, "/initialpose", 10
+                )
+                inner.create_timer(0.05, inner._poll_tf)  # 20Hz TF poll
+
+            def _poll_tf(inner):
+                import rclpy.time as _rt
+                try:
+                    tf = inner.tf_buffer.lookup_transform(
+                        "map", "base_link", _rt.Time()
+                    )
+                    tx = tf.transform.translation.x
+                    ty = tf.transform.translation.y
+                    q = tf.transform.rotation
+                    pose = {"x": tx, "y": ty, "yaw": quat_xyzw_to_yaw(q.x, q.y, q.z, q.w)}
+                    with provider._lock:
+                        provider._pose = pose
+                except Exception:
+                    pass
+
+        rclpy.init()
+        self._node = _InnerNode()
+        self._thread = threading.Thread(
+            target=rclpy.spin, args=(self._node,), daemon=True, name="amcl-spin"
+        )
+        self._thread.start()
+
+    def get_pose(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._pose) if self._pose is not None else None
+
+    def publish_initial_pose(
+        self,
+        x: float,
+        y: float,
+        yaw: float,
+        repeat: int = 3,
+        gap_sec: float = 0.8,
+        settle_sec: float = 5.0,
+    ):
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+        half = yaw * 0.5
+        for i in range(repeat):
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = "map"
+            msg.header.stamp = self._node.get_clock().now().to_msg()
+            msg.pose.pose.position.x = float(x)
+            msg.pose.pose.position.y = float(y)
+            msg.pose.pose.position.z = 0.0
+            msg.pose.pose.orientation.z = math.sin(half)
+            msg.pose.pose.orientation.w = math.cos(half)
+            msg.pose.covariance[0]  = 0.25
+            msg.pose.covariance[7]  = 0.25
+            msg.pose.covariance[35] = 0.0685
+            self._node._initialpose_pub.publish(msg)
+            print(f"[AMCL] publish_initial_pose ({i+1}/{repeat})  x={x:.2f} y={y:.2f} yaw={yaw:.2f}")
+            if i < repeat - 1:
+                time.sleep(gap_sec)
+        print(f"[AMCL] settling {settle_sec:.1f}s ...")
+        time.sleep(settle_sec)
+
+    def close(self):
+        import rclpy
+        rclpy.shutdown()
 
 
 # ===============================================================
@@ -205,8 +320,8 @@ def delta_to_pose(delta: torch.Tensor) -> torch.Tensor:
 
 class EdgeConfig:
     resume: bool = True
-    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP1+more_delay+no_lan/omnivla-original-balance--500000_chkpt-merged/"
-    resume_step: Optional[int] = 500000
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP2+more_delay+no_lan/omnivla-original-balance--550000_chkpt-merged/"
+    resume_step: Optional[int] = 550000
 
 
 def define_model(cfg: EdgeConfig):
@@ -777,18 +892,23 @@ class AsyncVLAEdgeClient:
         plt.close(fig)
 
 # ===============================================================
-# Main
+# Main (AMCL pose + ROS2 camera)
 # ===============================================================
 def main():
-    ISAACSIM_HOST = "192.168.0.180"
+    ISAACSIM_HOST = "127.0.0.1"
     SIM_PORT      = 8765
-    CMD_PORT      = 8766
 
     BASE_HOST = "192.168.0.154"
     BASE_PORT = 9001
+    CMD_HOST  = "127.0.0.1"       # cmd_vel bridge (same machine as edge)
+    CMD_PORT  = 8766
+
+    AMCL_INITIALPOSE_REPEAT   = 3    # /initialpose 반복 발행 횟수
+    AMCL_INITIALPOSE_GAP_SEC  = 0.8  # 반복 간격
+    AMCL_SETTLE_SEC           = 5.0  # AMCL settle 대기 시간
 
     HOLD_SECONDS_BEFORE_RESET = 3.0
-    HOLD_CMD_DT = 0.1
+    HOLD_CMD_DT               = 0.1
 
     STOP_LINEAR       = 0.02
     STOP_ANGULAR      = 0.02
@@ -798,33 +918,34 @@ def main():
     BASE_HZ    = 5.0
     EDGE_PERIOD = 1.0 / EDGE_HZ
     BASE_PERIOD = 1.0 / BASE_HZ
-    
+
     ARRIVAL_DISTANCE_THRESH = 0.7
     ARRIVAL_STOP_STEPS      = 15
-    
-    WARMUP_STEPS = EDGE_HZ * 2 # warmup for 2 seconds before starting a new episode session
-    warmup_counter = 0
+    WARMUP_STEPS            = int(EDGE_HZ * 2)
 
-    sim        = JsonSocketClient(ISAACSIM_HOST, SIM_PORT)
-    cmd_sender = JsonLineSender(ISAACSIM_HOST, CMD_PORT)
-    base_req   = AsyncBaseRequester(BASE_HOST, BASE_PORT)
-    cli        = AsyncVLAEdgeClient(
+    amcl         = AMCLPoseProvider()
+    sim          = JsonSocketClient(ISAACSIM_HOST, SIM_PORT)
+    cmd_sender   = JsonLineSender(CMD_HOST, CMD_PORT)
+    base_req     = AsyncBaseRequester(BASE_HOST, BASE_PORT)
+    cli          = AsyncVLAEdgeClient(
         control_hz=int(EDGE_HZ),
         base_hz=int(BASE_HZ),
         goal="marker3",
         save_dir="./results",
     )
 
-    episode_idx  = cli.get_next_episode_index()
-    global_step  = 0
-    episode_step = 0
-    stop_counter = 0
+    episode_idx   = cli.get_next_episode_index()
+    cli.set_episode_save_dir(episode_idx)
 
-    last_edge_t      = 0.0
+    global_step   = 0
+    episode_step  = 0
+    stop_counter  = 0
+    last_edge_t   = 0.0
     last_base_send_t = 0.0
-    
+    last_obs_warn_t  = 0.0
+    warmup_counter   = 0
     arrival_candidate_counter = 0
-    arrived = False 
+    arrived = False
 
     def hold_still(duration_sec: float):
         hold_start = time.time()
@@ -837,15 +958,24 @@ def main():
         arrival_candidate_counter = 0
         arrived = False
         warmup_counter = 0
-        
-        base_req.flush_response()      # stale 응답 제거
+        base_req.flush_response()
         cli.set_episode_save_dir(ep_idx)
+
+        # IsaacSim 랜덤 spawn → AMCL 초기 위치 설정
         reset_resp = sim.request({"cmd": "reset"})
-        print(f"[SIM RESET][EP {ep_idx:03d}] {reset_resp}")
-        return reset_resp
+        spawn_pose = reset_resp.get("pose", {})
+        print(f"[EP {ep_idx:03d}] sim reset → spawn x={spawn_pose.get('x', 0):.2f} "
+              f"y={spawn_pose.get('y', 0):.2f} yaw={spawn_pose.get('yaw', 0):.2f}")
+        amcl.publish_initial_pose(
+            x=spawn_pose["x"],
+            y=spawn_pose["y"],
+            yaw=spawn_pose["yaw"],
+            repeat=AMCL_INITIALPOSE_REPEAT,
+            gap_sec=AMCL_INITIALPOSE_GAP_SEC,
+            settle_sec=AMCL_SETTLE_SEC,
+        )
 
     try:
-        print("[SIM PING]", sim.request({"cmd": "ping"}))
         start_new_episode(episode_idx)
 
         while True:
@@ -865,21 +995,31 @@ def main():
                     start_new_episode(episode_idx)
                     continue
 
-            # 8Hz edge loop rate limiter
+            # 8Hz rate limiter
             if now_t - last_edge_t < EDGE_PERIOD:
                 time.sleep(0.001)
                 continue
             last_edge_t = now_t
 
-            # Get observation from sim
-            obs = sim.request({"cmd": "get_obs"})
-            if not obs.get("ok", False):
-                raise RuntimeError(f"get_obs failed: {obs}")
+            # Camera image from IsaacSim
+            obs_resp = sim.request({"cmd": "get_obs"})
+            if not obs_resp.get("ok", False):
+                if now_t - last_obs_warn_t >= 2.0:
+                    print(f"[SIM] get_obs failed: {obs_resp.get('error')}")
+                    last_obs_warn_t = now_t
+                continue
 
-            obs_ts      = float(obs["timestamp"])
-            current_img = cli.append_observation(obs["pose"], obs["image_b64"], obs_ts)
+            # Pose from AMCL
+            pose = amcl.get_pose()
+            if pose is None:
+                if now_t - last_obs_warn_t >= 2.0:
+                    print("[AMCL] waiting for TF map->base_link ...")
+                    last_obs_warn_t = now_t
+                continue
 
-            # Poll for new base response
+            obs_ts = float(obs_resp["timestamp"])
+            cli.append_observation(pose, obs_resp["image_b64"], obs_ts)
+
             base_resp = base_req.pop_latest_response()
             updated = cli.update_cached_base_result(base_resp, episode_idx)
             if updated:
@@ -888,27 +1028,25 @@ def main():
                     f"buffer_len={len(cli.obs_buffer)}"
                 )
 
-            # 8Hz 스텝마다 카운터 증가
             warmup_counter += 1
 
-            # 5Hz base request trigger — 워밍업 중엔 전송 안 함
             if now_t - last_base_send_t >= BASE_PERIOD and warmup_counter > WARMUP_STEPS:
                 payload = cli.make_base_request_payload(
-                    pose_dict=obs["pose"],
-                    image_b64=obs["image_b64"],
+                    pose_dict=pose,
+                    image_b64=obs_resp["image_b64"],
                     timestamp=obs_ts,
                     episode_idx=episode_idx,
                 )
-                enqueued = base_req.enqueue_latest(payload)
-                if enqueued:
+                if base_req.enqueue_latest(payload):
                     last_base_send_t = now_t
 
-            # Run edge policy
-            linear, angular, goal_distance, has_policy, model_predicts_stop = cli.run_policy_from_latest(save=not arrived) # stop saving jpg after arrival
+            linear, angular, goal_distance, has_policy, model_predicts_stop = (
+                cli.run_policy_from_latest(save=not arrived)
+            )
 
             is_stop_cmd = abs(linear) < STOP_LINEAR and abs(angular) < STOP_ANGULAR
             stop_counter = stop_counter + 1 if is_stop_cmd else 0
-            
+
             if not arrived:
                 if goal_distance < ARRIVAL_DISTANCE_THRESH and model_predicts_stop:
                     arrival_candidate_counter += 1
@@ -918,7 +1056,7 @@ def main():
                 if arrival_candidate_counter >= ARRIVAL_STOP_STEPS:
                     arrived = True
                     print("\n" + "=" * 60)
-                    print(f"  ✅  ARRIVED at [{cli.goal}]")
+                    print(f"  ARRIVED at [{cli.goal}]")
                     print(f"      dist={goal_distance:.3f}m  model_stop=True")
                     print(f"      ep={episode_idx:03d}  step={episode_step:05d}")
                     print("  Press [r] + Enter to reset")
@@ -928,7 +1066,7 @@ def main():
                 cmd_sender.send({"linear": 0.0, "angular": 0.0})
                 episode_step += 1
                 global_step  += 1
-                continue  # save_robot_behavior 및 stop_counter 로직 건너뜀
+                continue
 
             print(
                 f"[EP {episode_idx:03d}|EP_STEP {episode_step:05d}|STEP {global_step:07d}] "
@@ -939,7 +1077,6 @@ def main():
 
             cmd_sender.send({"linear": linear, "angular": angular})
 
-            # Episode termination on sustained stop
             if stop_counter >= STOP_COUNT_THRESH:
                 print(
                     f"[DONE][EP {episode_idx:03d}] "
@@ -947,7 +1084,6 @@ def main():
                     f"holding {HOLD_SECONDS_BEFORE_RESET:.1f}s then resetting"
                 )
                 hold_still(HOLD_SECONDS_BEFORE_RESET)
-
                 episode_idx  += 1
                 episode_step  = 0
                 stop_counter  = 0
@@ -967,6 +1103,7 @@ def main():
         base_req.close()
         cmd_sender.close()
         sim.close()
+        amcl.close()
 
 
 if __name__ == "__main__":
