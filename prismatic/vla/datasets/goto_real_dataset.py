@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 from prismatic.vla.constants import IGNORE_INDEX
 
 
-class GotoSim_Dataset(Dataset):
+class GotoReal_Dataset(Dataset):
     """
     Raw data structure
     --------------------------
@@ -113,8 +113,8 @@ class GotoSim_Dataset(Dataset):
         
         if goal_source_probs is None:
             goal_source_probs = {
-                "future": 0.6,
-                "destination": 0.4,
+                "future": 0.3,
+                "destination": 0.7,
             }
 
         if modality_probs is None:
@@ -174,8 +174,8 @@ class GotoSim_Dataset(Dataset):
         self.meaningful_threshold = meaningful_threshold
         self.max_resample_trials = max_resample_trials
 
-        self.action_root = self.root_dir / "goto" / "sim_v1_224rgb" / "action"
-        self.rgb_root = self.root_dir / "goto" / "sim_v1_224rgb" / "rgb"
+        self.action_root = self.root_dir / "goto" / "real_v2" / "action"
+        self.rgb_root = self.root_dir / "goto" / "real_v2" / "rgb"
 
         self.episodes: List[Dict[str, Any]] = self._load_episode_jsons(self.action_root)
         self.samples: List[Dict[str, Any]] = self._build_sample_index(self.episodes)
@@ -860,7 +860,7 @@ class GotoSim_Dataset(Dataset):
             pixel_values_goal=pixel_values_goal,
             input_ids=input_ids,
             labels=labels,
-            dataset_name="goto/sim",
+            dataset_name="goto/real",
             modality_id=modality_id,
             actions=actions,             # current-time action target
             action_select_mask=torch.tensor(1.0),

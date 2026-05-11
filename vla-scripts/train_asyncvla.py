@@ -7,7 +7,7 @@ Train or finetune AsyncVLA
 # ==============================
 # Configuration Flags
 # ==============================
-TRAIN_BASE = False   # True: training BASE VLA (if True, you need H100 or H200.)
+TRAIN_BASE = True   # True: training BASE VLA (if True, you need H100 or H200.)
 TRAIN_HEAD = True    # True: training Edge adapter and token projector
 VISUALIZE = False    # True: save visualization images of policy performance
 
@@ -108,6 +108,7 @@ from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, IGN
 # from prismatic.vla.datasets.sacson_dataset import SACSoN_Dataset_rand
 # from prismatic.vla.datasets.dummy_dataset import Dummy_Dataset
 from prismatic.vla.datasets.goto_sim_dataset import GotoSim_Dataset
+from prismatic.vla.datasets.goto_real_dataset import GotoReal_Dataset
 
 #small head model
 from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens
@@ -1108,8 +1109,8 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
     # Bgnm, Blan, Bsacson = 1, 1, 1    
     #Bgnm, Blan, Bsacson = 30, 30, 30
 
-    train_dataset_dummy = []
-    test_dataset_dummy = []        
+    # train_dataset_dummy = []
+    # test_dataset_dummy = []        
     for data_split_type in ["train"]:     
         #Goto sim dataset
         if data_split_type == "train":
@@ -1146,6 +1147,44 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
                 drop_last=True,
                 persistent_workers=True,
                 sampler=sampler_train_gotosim,
+                generator=g if cfg.inference_seed is not None else None,
+            )
+        
+        #Goto real dataset
+        if data_split_type == "train":
+            dataset_gotoreal = GotoReal_Dataset(
+                root_dir=cfg.data_root_dir,
+                image_transform=processor.image_processor.apply_transform,
+                action_tokenizer=action_tokenizer,
+                prompt_builder_fn=PurePromptBuilder,
+                base_tokenizer=processor.tokenizer,
+            )
+            
+            train_dataset_gotoreal = []
+            train_dataset_gotoreal.append(dataset_gotoreal)
+            train_dataset_gotoreal = ConcatDataset(train_dataset_gotoreal)
+            
+            sampler_train_gotoreal = DistributedSampler(
+                train_dataset_gotoreal,
+                num_replicas=world_size,
+                rank=device_id,
+                shuffle=True,
+                seed=cfg.inference_seed if cfg.inference_seed is not None else 0,
+            )
+            
+            if cfg.inference_seed is not None:
+                g = torch.Generator()
+                g.manual_seed(cfg.inference_seed)
+            
+            train_loader_gotoreal = DataLoader(
+                train_dataset_gotoreal,
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                collate_fn=collator,
+                num_workers=config["num_workers"],
+                drop_last=True,
+                persistent_workers=True,
+                sampler=sampler_train_gotoreal,
                 generator=g if cfg.inference_seed is not None else None,
             )
             
@@ -1359,8 +1398,12 @@ def train_asyncvla(cfg: OmniVLAConfig) -> None:
     }    
     # iters = [iter(train_loader_gnm), iter(train_loader_lelan), iter(train_loader_sacson)]
     # samplers = [sampler_train_gnm, sampler_train_lelan, sampler_train_sacson]          
-    iters = [iter(train_loader_gotosim)]
-    samplers = [sampler_train_gotosim]
+    
+    iters = [iter(train_loader_gotoreal)] 
+    samplers = [sampler_train_gotoreal]
+    
+    # iters = [iter(train_loader_gotosim), iter(train_loader_gotoreal)] 
+    # samplers = [sampler_train_gotosim, sampler_train_gotoreal]
     
                                                                   
     log_count = 0
