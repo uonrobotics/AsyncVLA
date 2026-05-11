@@ -63,98 +63,124 @@ from prismatic.models.small_head import Proj_Actiontokens
 
 goal_image_paths = {
     "forklift": "./inference/finetune_model/goal_img/forklift.png",
-    "marker1": "./inference/finetune_model/goal_img/marker1.png",
-    "marker2": "./inference/finetune_model/goal_img/marker2.png",
-    "marker3": "./inference/finetune_model/goal_img/marker3.png",
-    "marker4": "./inference/finetune_model/goal_img/marker4.png",
-    "marker5": "./inference/finetune_model/goal_img/marker5.png",
-    "pallet": "./inference/finetune_model/goal_img/pallet.png",
+    "marker1":  "./inference/finetune_model/goal_img/marker1.png",
+    "marker2":  "./inference/finetune_model/goal_img/marker2.png",
+    "marker3":  "./inference/finetune_model/goal_img/marker3.png",
+    "marker4":  "./inference/finetune_model/goal_img/marker4.png",
+    "marker5":  "./inference/finetune_model/goal_img/marker5.png",
+    "pallet":   "./inference/finetune_model/goal_img/pallet.png",
 }
 
-pose_goal = True
-satellite = False
-image_goal = True
-lan_prompt = False
+pose_goal    = True
+satellite    = False
+image_goal   = True
+lan_prompt   = False
 
 
+# ===============================================================
+# JSON Socket Server (base side)
+# ===============================================================
 class JsonSocketServer:
+    """
+    Non-blocking TCP server for the base machine.
+    Handles partial recv correctly by accumulating into self.buffer.
+    Large recv buffer configured for image payloads from edge.
+    """
+
     def __init__(self, host="0.0.0.0", port=9001):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind((host, port))
         self.server.listen(1)
         self.server.setblocking(False)
-        self.client = None
+        self.client: Optional[socket.socket] = None
         self.buffer = b""
 
-    def _drop_client(self):
+    def _drop_client(self, reason: str = ""):
         if self.client is not None:
             try:
                 self.client.close()
             except Exception:
                 pass
-        self.client = None
-        self.buffer = b""
+            self.client = None
+            self.buffer = b""
+            if reason:
+                print(f"[BASE IPC] client dropped: {reason}")
 
     def poll_accept(self):
         if self.client is not None:
             return
         readable, _, _ = select.select([self.server], [], [], 0.0)
         if readable:
-            conn, addr = self.server.accept()
-            conn.setblocking(False)
-            self.client = conn
-            self.buffer = b""
-            print(f"[BASE IPC] connected from {addr}")
+            try:
+                conn, addr = self.server.accept()
+                conn.setblocking(False)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+                self.client = conn
+                self.buffer = b""
+                print(f"[BASE IPC] client connected from {addr}")
+            except OSError as e:
+                print(f"[BASE IPC] accept error: {e}")
 
-    def recv_message(self):
+    def recv_message(self) -> Optional[dict]:
         self.poll_accept()
         if self.client is None:
             return None
 
         try:
             readable, _, exceptional = select.select([self.client], [], [self.client], 0.0)
-        except (OSError, ValueError):
-            self._drop_client()
+        except (OSError, ValueError) as e:
+            self._drop_client(f"select error: {e}")
             return None
 
         if exceptional:
-            self._drop_client()
+            self._drop_client("socket exception flag")
             return None
 
         if not readable:
             return None
 
+        # Drain all available data in a loop (handle partial sends)
         try:
-            data = self.client.recv(10_000_000)
-        except (BlockingIOError, InterruptedError):
-            return None
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            self._drop_client()
+            while True:
+                chunk = self.client.recv(1 << 20)  # 1 MB chunks
+                if not chunk:
+                    self._drop_client("client closed connection")
+                    return None
+                self.buffer += chunk
+                r, _, _ = select.select([self.client], [], [], 0.0)
+                if not r:
+                    break
+        except BlockingIOError:
+            pass
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            self._drop_client(f"recv error: {e}")
             return None
 
-        if not data:
-            self._drop_client()
-            return None
-
-        self.buffer += data
         if b"\n" not in self.buffer:
             return None
 
         line, self.buffer = self.buffer.split(b"\n", 1)
-        if not line.strip():
+        line = line.strip()
+        if not line:
             return None
 
-        return json.loads(line.decode("utf-8"))
+        try:
+            return json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            print(f"[BASE IPC] JSON decode error: {e} | raw={line[:120]}")
+            return None
 
-    def send_message(self, payload: dict):
+    def send_message(self, payload: dict) -> bool:
         if self.client is None:
+            print("[BASE IPC] send_message called but no client connected")
             return False
         try:
-            self.client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            data = (json.dumps(payload) + "\n").encode("utf-8")
+            self.client.sendall(data)
             return True
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            self._drop_client()
+        except (ConnectionResetError, BrokenPipeError, OSError) as e:
+            self._drop_client(f"send error: {e}")
             return False
 
     def close(self):
@@ -165,15 +191,17 @@ class JsonSocketServer:
             pass
 
 
+# ===============================================================
+# Model utilities
+# ===============================================================
 def remove_ddp_in_checkpoint(state_dict: dict) -> dict:
     return {k[7:] if k.startswith("module.") else k: v for k, v in state_dict.items()}
 
 
 def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu") -> dict:
-    if (
-        not os.path.exists(os.path.join(path, f"{module_name}--{step}_checkpoint.pt"))
-        and module_name == "pose_projector"
-    ):
+    # Fallback: older checkpoints may use "proprio_projector" instead of "pose_projector"
+    primary = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    if not os.path.exists(primary) and module_name == "pose_projector":
         module_name = "proprio_projector"
 
     checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
@@ -215,8 +243,8 @@ def init_module(
 
 class InferenceConfig:
     resume: bool = True
-    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA/AsyncVLA_release--790000_chkpt-merged/"
-    resume_step: Optional[int] = 790000
+    vla_path: str = "/nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP2+more_delay+no_lan/omnivla-original-balance--550000_chkpt-merged/"
+    resume_step: Optional[int] = 550000
     use_l1_regression: bool = True
     use_diffusion: bool = False
     use_film: bool = False
@@ -228,12 +256,17 @@ class InferenceConfig:
 
 def define_model(cfg: InferenceConfig):
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    print(f"Loading AsyncVLA base model `{cfg.vla_path}`")
+    print(f"[INIT 0/8] Loading AsyncVLA base model `{cfg.vla_path}`")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.cuda.set_device(device)
         torch.cuda.empty_cache()
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        print(f"[INIT 0/8] GPU: {torch.cuda.get_device_name(device)} | "
+              f"free={free_mem/1e9:.1f}GB / total={total_mem/1e9:.1f}GB")
+    else:
+        print("[INIT 0/8] No CUDA — running on CPU")
 
     print(
         "Detected constants:\n"
@@ -243,21 +276,33 @@ def define_model(cfg: InferenceConfig):
         f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}"
     )
 
+    print("[INIT 1/8] Registering AutoModel classes...")
     AutoConfig.register("openvla", OpenVLAConfig)
     AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction_MMNv1)
 
+    print("[INIT 2/8] Loading processor...")
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+
+    print("[INIT 3/8] from_pretrained shards -> CPU bfloat16...")
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-    ).to(device)
+    )
 
+    print("[INIT 4/8] Moving VLA to device (may take 30-60s for large models)...")
+    vla = vla.to(device)
+    if device.type == "cuda":
+        free_mem, _ = torch.cuda.mem_get_info(device)
+        print(f"[INIT 4/8] GPU free after VLA .to(device): {free_mem/1e9:.1f}GB")
+
+    print("[INIT 5/8] set_num_images_in_input + dtype cast...")
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
     vla.to(dtype=torch.bfloat16, device=device)
 
+    print("[INIT 6/8] Loading pose_projector checkpoint...")
     pose_projector = init_module(
         ProprioProjector,
         "pose_projector",
@@ -266,6 +311,7 @@ def define_model(cfg: InferenceConfig):
         {"llm_dim": vla.llm_dim, "proprio_dim": POSE_DIM},
     )
 
+    print("[INIT 7/8] Loading action_proj checkpoint...")
     action_proj = init_module(
         Proj_Actiontokens,
         "action_proj",
@@ -279,10 +325,12 @@ def define_model(cfg: InferenceConfig):
         vla.vision_backbone.get_num_patches()
         * vla.vision_backbone.get_num_images_in_input()
     )
-    num_patches += 1  # for goal pose
+    num_patches += 1  # goal pose token
 
+    print("[INIT 8/8] Building ActionTokenizer... done.")
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
+    print("[INIT] All components loaded successfully.")
     return (
         vla.eval(),
         pose_projector.eval(),
@@ -294,6 +342,9 @@ def define_model(cfg: InferenceConfig):
     )
 
 
+# ===============================================================
+# AsyncVLA Base Server
+# ===============================================================
 class AsyncVLABaseServer:
     def __init__(self):
         cfg = InferenceConfig()
@@ -422,7 +473,6 @@ class AsyncVLABaseServer:
         lan_inst_prompt: str,
     ):
         actions = np.random.rand(8, 4).astype(np.float32)
-
         batch_data = self.transform_datatype(
             lan_inst_prompt,
             actions,
@@ -434,7 +484,6 @@ class AsyncVLABaseServer:
             base_tokenizer=self.processor.tokenizer,
             image_transform=self.processor.image_processor.apply_transform,
         )
-
         return self.collator_custom(
             [batch_data],
             self.processor.tokenizer.model_max_length,
@@ -442,7 +491,7 @@ class AsyncVLABaseServer:
         )
 
     @staticmethod
-    def get_modality_id():
+    def get_modality_id() -> torch.Tensor:
         if satellite and not lan_prompt and not pose_goal and not image_goal:
             return torch.as_tensor([0], dtype=torch.float32)
         elif satellite and not lan_prompt and pose_goal and not image_goal:
@@ -470,7 +519,7 @@ class AsyncVLABaseServer:
         goal_image_PIL: Image.Image,
         goal_pose_loc_norm: np.ndarray,
         lan_inst_prompt: str,
-    ):
+    ) -> dict:
         batch = self.build_batch(
             current_image_PIL=current_image_PIL,
             goal_image_PIL=goal_image_PIL,
@@ -503,7 +552,7 @@ class AsyncVLABaseServer:
         next_actions_mask = get_next_actions_mask(ground_truth_token_ids)
 
         last_hidden_states = output.hidden_states[-1]
-        text_hidden_states = last_hidden_states[:, self.num_patches : -1]
+        text_hidden_states = last_hidden_states[:, self.num_patches: -1]
         batch_size = batch["input_ids"].shape[0]
 
         actions_hidden_states = (
@@ -531,12 +580,13 @@ def main():
     server = JsonSocketServer(host=HOST, port=PORT)
     base = AsyncVLABaseServer()
 
-    print(f"[BASE SERVER] listening on {HOST}:{PORT}")
+    print(f"[BASE SERVER] ready, listening on {HOST}:{PORT}")
 
     try:
         while True:
             msg = server.recv_message()
             if msg is None:
+                time.sleep(0.001)  # Avoid busy-spinning when idle
                 continue
 
             cmd = msg.get("cmd")
@@ -546,36 +596,61 @@ def main():
 
             elif cmd == "infer_base":
                 t_recv = time.time()
-                
-                current_image_PIL = base.decode_image_b64(msg["image_b64"])
-                goal_pose_loc_norm = np.asarray(msg["goal_pose_loc_norm"], dtype=np.float32)
+                obs_timestamp = float(msg["timestamp"])
+                episode_idx = msg.get("episode_idx", -1)
 
-                goal_name = msg.get("goal_name", "marker3")
-                if goal_name not in goal_image_paths:
-                    raise RuntimeError(f"Unknown goal_name: {goal_name}")
+                try:
+                    current_image_PIL = base.decode_image_b64(msg["image_b64"])
+                    goal_pose_loc_norm = np.asarray(
+                        msg["goal_pose_loc_norm"], dtype=np.float32
+                    )
+                    goal_name = msg.get("goal_name", "marker3")
+                    if goal_name not in goal_image_paths:
+                        raise ValueError(f"Unknown goal_name: {goal_name}")
+                    goal_image_PIL = Image.open(goal_image_paths[goal_name]).convert("RGB")
+                    lan_inst_prompt = msg.get("lan_inst_prompt", "xxxx")
 
-                goal_image_PIL = Image.open(goal_image_paths[goal_name]).convert("RGB")
-                lan_inst_prompt = msg.get("lan_inst_prompt", "xxxx")
+                    out = base.infer_base(
+                        current_image_PIL=current_image_PIL,
+                        goal_image_PIL=goal_image_PIL,
+                        goal_pose_loc_norm=goal_pose_loc_norm,
+                        lan_inst_prompt=lan_inst_prompt,
+                    )
 
-                out = base.infer_base(
-                    current_image_PIL=current_image_PIL,
-                    goal_image_PIL=goal_image_PIL,
-                    goal_pose_loc_norm=goal_pose_loc_norm,
-                    lan_inst_prompt=lan_inst_prompt,
-                )
-                
-                # inference 후 랜덤 delay
-                elapsed = time.time() - t_recv
-                target = random.uniform(0.10, 0.60) # network latency 재현 
-                remaining = target - elapsed
-                if remaining > 0:
-                    time.sleep(remaining)
+                    # Network latency simulation
+                    elapsed = time.time() - t_recv
+                    target = random.uniform(0.10, 0.60)
+                    remaining = target - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
 
-                server.send_message({
-                    "ok": True,
-                    "timestamp": float(msg["timestamp"]),
-                    **out,
-                })
+                    t_send = time.time()
+                    ok = server.send_message({
+                        "ok": True,
+                        "timestamp": obs_timestamp,  # echo original timestamp for buffer matching
+                        "episode_idx": msg.get("episode_idx"),
+                        **out,
+                    })
+                    if not ok:
+                        print(
+                            f"[BASE SERVER] send_message FAILED for ts={obs_timestamp:.6f} "
+                            "(client may have disconnected during inference)"
+                        )
+                    else:
+                        print(
+                            f"[BASE SERVER] infer_base done | ts={obs_timestamp:.6f} "
+                            f"inference+delay={time.time()-t_recv:.3f}s "
+                            f"modality={out['modality_id']}"
+                        )
+
+                except Exception as e:
+                    print(f"[BASE SERVER] infer_base error: {e}")
+                    server.send_message({
+                        "ok": False,
+                        "error": str(e),
+                        "timestamp": obs_timestamp,
+                        "episode_idx": msg.get("episode_idx"),
+                    })
 
             else:
                 server.send_message({"ok": False, "error": f"unknown cmd: {cmd}"})

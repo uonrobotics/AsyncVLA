@@ -21,3 +21,5 @@ AsyncVLA_release/
 AsyncVLA_v0/
 inference/run_asyncvla_.py
 inference/run_asyncvla_v0_.py
+
+results/

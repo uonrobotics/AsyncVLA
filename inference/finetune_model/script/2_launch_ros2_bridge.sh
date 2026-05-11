@@ -9,4 +9,4 @@ unset CONDA_DEFAULT_ENV
 source /opt/ros/jazzy/setup.bash
 source ~/IsaacSim-ros_workspaces/jazzy_ws/install/local_setup.bash
 
-/usr/bin/python3.12 /home/sujin/workspace/physical-ai/OmniVLA/inference/finetune_model/ros2_cmdvel_bridge.py
+/usr/bin/python3.12 /home/sujin/workspace/physical-ai/AsyncVLA/inference/finetune_model/ros2_cmdvel_bridge.py

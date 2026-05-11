@@ -15,9 +15,10 @@ CLI usage
 ─────────────────────────────────────────────────────────────────
   # auto-detect checkpoint step from folder name
   python vla-scripts/visualize_asyncvla.py \
-      --vla_path /nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP1/omnivla-original-balance--450000_chkpt-merged/ \
+      --vla_path /nas/sujinkim/model/goto/sim/20260323_224/AsyncVLA+2_step_trainig__STEP2+more_delay+no_lan/omnivla-original-balance--510000_chkpt-merged/ \
       --num_samples 100 \
       --data_root_dir /nas/sujinkim/data/goto/sim/20260323/ \
+      --seed 123 \
 ─────────────────────────────────────────────────────────────────
 """
 
@@ -179,10 +180,10 @@ def visualize_asyncvla(
                 arrowprops=dict(arrowstyle="->", color=color, lw=1.4),
                 zorder=zorder + 1)
 
-    _plot_traj(gt_actions,             "red",        "GT trajectory",              "o",  lw=3.0, ms=9,  zorder=5)
-    _plot_traj(base_vlm_actions,       "orange",     "Base VLM (no edge adapter)", "s",  lw=2.0, ms=7,  zorder=4)
-    _plot_traj(past_corrected_actions, "royalblue",  "Past-image corrected",       "^",  lw=2.5, ms=8,  zorder=4)
-    _plot_traj(cur_corrected_actions,  "dodgerblue", "Current-image corrected",    "D",  lw=2.5, ms=8,  zorder=4)
+    _plot_traj(gt_actions,             "#1a1aff",   "GT trajectory",              "o",  lw=2.0, ms=7,  zorder=6)
+    _plot_traj(cur_corrected_actions,  "#00bfff",   "Current-image corrected",    "^",  lw=3.5, ms=10, zorder=5)
+    _plot_traj(base_vlm_actions,       "#8B008B",   "Base VLM (no edge adapter)", "o",  lw=2.0, ms=7,  zorder=4)
+    _plot_traj(past_corrected_actions, "#FF69B4",   "Past-image corrected",       "^",  lw=3.5, ms=10, zorder=3)
 
     ax_traj.plot(0, 0, marker="P", color="black", markersize=14, label="Robot (origin)", zorder=6)
 
@@ -260,6 +261,7 @@ def _load_model(vla_path: str, resume_step: int, device: torch.device):
     from prismatic.models.small_head import Edge_adapter, Proj_Actiontokens
     from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM
     from prismatic.vla.action_tokenizer import ActionTokenizer
+    from prismatic.models.action_heads import L1RegressionActionHead_idcat
 
     # ── register to HF Auto Classes (same as inference_asyncvla.py) ──
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -296,6 +298,13 @@ def _load_model(vla_path: str, resume_step: int, device: torch.device):
     pose_projector = ProprioProjector(llm_dim=vla.llm_dim, proprio_dim=POSE_DIM)
     pose_projector.load_state_dict(_load_ckpt("pose_projector"))
     pose_projector.to(device).eval()
+    
+    # ── action_head ───────────────────────────────────────────────────
+    action_head = L1RegressionActionHead_idcat(
+        input_dim=vla.llm_dim, hidden_dim=vla.llm_dim, action_dim=ACTION_DIM)
+    action_head.load_state_dict(_load_ckpt("action_head"))
+    action_head.to(torch.bfloat16).to(device).eval()
+
 
     # ── action_proj ───────────────────────────────────────────────────
     action_proj = Proj_Actiontokens(
@@ -323,7 +332,7 @@ def _load_model(vla_path: str, resume_step: int, device: torch.device):
     NUM_PATCHES = (vla.vision_backbone.get_num_patches()
                    * vla.vision_backbone.get_num_images_in_input() + 1)
 
-    return (vla, action_proj, pose_projector, shead,
+    return (vla, action_head, action_proj, pose_projector, shead,
             action_tokenizer, processor, NUM_PATCHES,
             ACTION_DIM, NUM_ACTIONS_CHUNK)
 
@@ -339,7 +348,7 @@ def _run_inference(sample: dict, model_bundle, past_img: Image.Image,
     from torchvision.transforms.functional import to_tensor, resize
     from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 
-    (vla, action_proj, pose_projector, shead,
+    (vla, action_head, action_proj, pose_projector, shead,
      action_tokenizer, processor,
      NUM_PATCHES, ACTION_DIM, NUM_ACTIONS_CHUNK) = model_bundle
 
@@ -397,11 +406,11 @@ def _run_inference(sample: dict, model_bundle, past_img: Image.Image,
     )
 
     with torch.no_grad():
+        # base VLM: before edge adapter
+        base_vlm = action_head.predict_action(
+            act_hidden, modality_id_t.to(torch.bfloat16).to(device))
         proj = action_proj.predict_action(
             act_hidden, modality_id_t.to(torch.bfloat16).to(device))
-
-    # base VLM: before edge adapter
-    base_vlm = delta_to_pose(proj).cpu().float()
 
     # ── edge adapter – mirror inference loop ──────────────────────────
     # inference_asyncvla.py:
